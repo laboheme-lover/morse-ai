@@ -1,0 +1,177 @@
+"""連続モールス信号音声から複数文字を認識するモジュール(Milestone 9)。
+
+音声を文字ごとに分割(morse_segmentation.py)し、各区間をCNNで推論
+(predict.predict_waveform)して結果を連結し、日本語文字列として返す。
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import librosa
+import numpy as np
+import torch
+
+from morse_cnn import MorseCNN
+from morse_dataset import SAMPLE_RATE
+from morse_segmentation import (
+    DEFAULT_FRAME_MS,
+    DEFAULT_MIN_CHAR_GAP_SECONDS,
+    DEFAULT_PADDING_SECONDS,
+    DEFAULT_THRESHOLD_RATIO,
+    split_into_characters,
+)
+from morse_table import compose_pair
+from predict import DEFAULT_MODELS_DIR, DEFAULT_TOP_K, PredictionResult, load_model, predict_waveform
+
+if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+@dataclass
+class CharacterPrediction:
+    """1文字分の区間情報と推論結果。"""
+
+    start_sample: int
+    end_sample: int
+    sample_rate: int
+    result: PredictionResult
+
+    @property
+    def start_seconds(self) -> float:
+        return self.start_sample / self.sample_rate
+
+    @property
+    def end_seconds(self) -> float:
+        return self.end_sample / self.sample_rate
+
+
+@dataclass
+class SequencePrediction:
+    """連続音声全体の認識結果。"""
+
+    text: str
+    characters: list[CharacterPrediction]
+
+
+@dataclass
+class DisplayUnit:
+    """画面表示用の1文字分(濁音・半濁音は基本仮名+濁点/半濁点の2区間を1単位に結合する)。"""
+
+    text: str
+    confidence: float  # 構成する区間の確信度のうち最小のもの
+    segment_indices: list[int]
+    needs_review: bool
+
+
+def build_display_units(sequence: SequencePrediction, low_confidence_threshold: float) -> list[DisplayUnit]:
+    """認識結果を画面表示用の単位へ変換する。
+
+    CNNは基本仮名と濁点/半濁点を別クラスとして認識するため、モールス符号上は
+    2区間に分かれている。morse_table.compose_dakuten()と同じ規則で(基本仮名, 濁点/
+    半濁点)の並びを1単位(ガ・プ等)へ結合し、確信度は2区間のうち低い方を採用する。
+    確信度がlow_confidence_threshold未満の単位は要確認(needs_review)とする。
+    """
+    units: list[DisplayUnit] = []
+    chars = sequence.characters
+    i = 0
+    while i < len(chars):
+        current = chars[i].result
+        if i + 1 < len(chars):
+            following = chars[i + 1].result
+            composed = compose_pair(current.prediction, following.prediction)
+            if composed is not None:
+                confidence = min(current.confidence, following.confidence)
+                units.append(DisplayUnit(composed, confidence, [i, i + 1], confidence < low_confidence_threshold))
+                i += 2
+                continue
+        units.append(
+            DisplayUnit(current.prediction, current.confidence, [i], current.confidence < low_confidence_threshold)
+        )
+        i += 1
+    return units
+
+
+def predict_sequence_from_waveform(
+    y: np.ndarray,
+    sr: int,
+    model: MorseCNN,
+    index_to_label: dict[int, str],
+    fixed_frames: int,
+    top_k: int = DEFAULT_TOP_K,
+    min_char_gap_seconds: float = DEFAULT_MIN_CHAR_GAP_SECONDS,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    threshold_ratio: float = DEFAULT_THRESHOLD_RATIO,
+    padding_seconds: float = DEFAULT_PADDING_SECONDS,
+    device: str = "cpu",
+) -> SequencePrediction:
+    """読み込み済みの波形を文字ごとに分割し、各文字を推論して連結する。
+
+    モデルを読み込み済みの状態で繰り返し推論できるため、Streamlit UIのように
+    しきい値等を変えながら何度も認識する用途に向く。
+    """
+    ranges = split_into_characters(y, sr, min_char_gap_seconds, frame_ms, threshold_ratio, padding_seconds)
+
+    characters: list[CharacterPrediction] = []
+    for start, end in ranges:
+        chunk = y[start:end]
+        result = predict_waveform(chunk, model, index_to_label, fixed_frames, sr, device, top_k)
+        characters.append(CharacterPrediction(start, end, sr, result))
+
+    text = "".join(c.result.prediction for c in characters)
+    return SequencePrediction(text=text, characters=characters)
+
+
+def predict_sequence(
+    wav_path: str | Path,
+    models_dir: str | Path = DEFAULT_MODELS_DIR,
+    top_k: int = DEFAULT_TOP_K,
+    min_char_gap_seconds: float = DEFAULT_MIN_CHAR_GAP_SECONDS,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    threshold_ratio: float = DEFAULT_THRESHOLD_RATIO,
+    padding_seconds: float = DEFAULT_PADDING_SECONDS,
+    device: str | None = None,
+) -> SequencePrediction:
+    """連続音声WAVを文字ごとに分割し、各文字を推論して連結する。
+
+    文字間の無音がmin_char_gap_seconds未満だと2文字が1文字として結合されて
+    しまい、逆に短すぎる値だと1文字が誤って複数に分割されてしまう。
+    このしきい値はStreamlit UI(Milestone 10)でユーザーが調整できるようにする。
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model, _label_to_index, index_to_label, fixed_frames = load_model(models_dir, device)
+
+    y, sr = librosa.load(str(wav_path), sr=SAMPLE_RATE, mono=True)
+    return predict_sequence_from_waveform(
+        y, sr, model, index_to_label, fixed_frames, top_k,
+        min_char_gap_seconds, frame_ms, threshold_ratio, padding_seconds, device,
+    )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="連続モールス信号WAVから複数文字を認識する")
+    parser.add_argument("wav", help="入力WAVファイル")
+    parser.add_argument("--models-dir", default=str(DEFAULT_MODELS_DIR))
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument(
+        "--min-char-gap", type=float, default=DEFAULT_MIN_CHAR_GAP_SECONDS, help="文字境界とみなす無音の最小長[秒]"
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    result = predict_sequence(args.wav, args.models_dir, args.top_k, min_char_gap_seconds=args.min_char_gap)
+    print(f"認識結果: {result.text}")
+    for i, c in enumerate(result.characters, start=1):
+        print(
+            f"  {i}. {c.result.prediction} (確信度={c.result.confidence:.3f}, "
+            f"区間={c.start_seconds:.2f}-{c.end_seconds:.2f}s)"
+        )
+
+
+if __name__ == "__main__":
+    main()
