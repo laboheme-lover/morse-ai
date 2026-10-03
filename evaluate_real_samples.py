@@ -66,12 +66,16 @@ DEFAULT_OUTPUT_CSV = Path("evaluation/real_samples_report.csv")
 
 def find_matched_pairs(sound_dir: Path, text_dir: Path) -> list[tuple[int, Path, Path]]:
     """Sound側とTEXT側の両方に存在する番号のペアのみを返す(片方しか無いものは除外)。"""
+    # (1) Soundフォルダの音声を「番号 → ファイル」の辞書にする。
+    #     ファイル名 "Taman_41 [xxxx].mp3" から正規表現で番号 41 を取り出す。
     sound_by_number: dict[int, Path] = {}
     for path in sound_dir.iterdir():
         m = SOUND_FILENAME_RE.match(path.name)
         if m:
             sound_by_number[int(m.group(1))] = path
 
+    # (2) TEXTフォルダの "41.txt" などを番号順に見て、同じ番号の音声があるものだけを組にする
+    #     (正解テキストの無い音声・音声の無いテキストは評価から外す)
     pairs: list[tuple[int, Path, Path]] = []
     for text_path in sorted(text_dir.glob("*.txt"), key=lambda p: int(p.stem) if p.stem.isdigit() else -1):
         if not text_path.stem.isdigit():
@@ -90,6 +94,8 @@ def hiragana_to_katakana(text: str) -> str:
     (Taman_49の49.txtが該当)を語彙外として捨ててしまうと、正解が大幅に
     欠けて評価が誤る(実際に295字のひらがなが除外され、84字しか残らなかった)。
     """
+    # Unicodeではひらがな(ぁ U+3041 〜)とカタカナ(ァ U+30A1 〜)が同じ並び順で0x60離れているので、
+    # 文字コードに0x60を足せば対応するカタカナになる(例 あ U+3042 → ア U+30A2)
     return "".join(chr(ord(ch) + 0x60) if "ぁ" <= ch <= "ゖ" else ch for ch in text)
 
 
@@ -104,9 +110,14 @@ def normalize_ground_truth(raw_text: str) -> tuple[str, list[str]]:
 
     戻り値は (絞り込んだ正解テキスト, 除外された文字の一覧) のタプル。
     """
+    # (1) NFKC正規化: 全角数字「１」→「1」、半角カナ「ｱ」→「ア」など、見た目が同じ文字の表記を1つにそろえる
+    # (2) ひらがな → カタカナ
     text = hiragana_to_katakana(unicodedata.normalize("NFKC", raw_text))
+    # (3) 小書き仮名 → 通常の仮名(ッ→ツ 等)。和文モールスに小書き専用の符号は無い
     text = text.translate(SMALL_KANA_TO_NORMAL)
+    # (4) 空白・改行を除く(送信には現れない)
     text = "".join(ch for ch in text if not ch.isspace())
+    # (5) 符号で表せる文字だけを残し、除いた文字は一覧にして返す(何が除かれたかを後で確認するため)
     filtered = "".join(ch for ch in text if is_supported(ch))
     excluded = sorted({ch for ch in text if not is_supported(ch)})
     return filtered, excluded
@@ -120,21 +131,25 @@ def compare_texts(predicted: str, ground_truth: str) -> dict:
     文章でも類似度が数%にまで過小評価される。そのためautojunk=Falseで照合する。
     (実際に400文字・一致率86%の文章が、標準設定では4.3%と評価された。)
     """
+    # 正解と認識結果を、文字の並びとして最もよく重なるように対応付ける(文字のずれ・抜け・余分を許容する)
     matcher = difflib.SequenceMatcher(None, ground_truth, predicted, autojunk=False)
     matched = substituted = inserted = deleted = 0
+    # get_opcodes() は「正解の i1〜i2 文字目」と「認識結果の j1〜j2 文字目」がどういう関係かを順に返す
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         gt_len, pred_len = i2 - i1, j2 - j1
-        if tag == "equal":
+        if tag == "equal":  # 一致: 同じ文字が並んでいる
             matched += gt_len
-        elif tag == "replace":
+        elif tag == "replace":  # 置換: 別の文字に間違えた
+            # 長さが違う場合、対になる分は置換、正解側の余りは脱落、認識側の余りは挿入として数える
             paired = min(gt_len, pred_len)
             substituted += paired
             deleted += gt_len - paired
             inserted += pred_len - paired
-        elif tag == "delete":
+        elif tag == "delete":  # 脱落: 正解にある文字を認識できなかった
             deleted += gt_len
-        elif tag == "insert":
+        elif tag == "insert":  # 挿入: 正解に無い文字を余分に出した
             inserted += pred_len
+    # すべて「正解の文字数」に対する割合にする(一致率+置換率+脱落率 = 1。挿入率は別枠)
     n = max(len(ground_truth), 1)
     return {
         "similarity": matcher.ratio(),
@@ -156,11 +171,14 @@ def evaluate_pair(
     tmp_dir: Path | None = None,
 ) -> dict:
     """1組のSound/TEXTペアを評価する。"""
+    # (1) 正解テキストを読み、認識結果と比べられる形にそろえる
     raw_text = text_path.read_text(encoding="utf-8")
     ground_truth, excluded_chars = normalize_ground_truth(raw_text)
 
+    # (2) 音声を16kHz・モノラルで読み込む(MP3 44.1kHzステレオからの変換を含む)
     y, sr = librosa.load(str(sound_path), sr=16000, mono=True)
 
+    # (3) 前処理ありなら、前処理後の音声を一時WAVに書いて認識に使う。短点の長さもその音声で測る
     if preprocess:
         processed_y, analysis = preprocess_for_inference(y, sr)
         measured_freq = analysis.frequency_hz
@@ -175,14 +193,17 @@ def evaluate_pair(
         inference_path = sound_path
         dot_estimate = estimate_dot_seconds(y, sr)
 
+    # (4) 文字の区切りのしきい値 = 短点の長さ × 1.8(アプリの自動推定と同じ規則)
     min_gap = max(min_gap_floor, dot_estimate * gap_multiplier)
 
+    # (5) 連続音声認識を行い、「カ゛」を「ガ」のように結合して正解テキストと同じ表記にする
     result = predict_sequence(inference_path, models_dir=models_dir, top_k=top_k, min_char_gap_seconds=min_gap)
     predicted_text = compose_dakuten(result.text)
 
     if preprocess and isinstance(inference_path, Path):
         inference_path.unlink(missing_ok=True)
 
+    # (6) 正解と比べて、一致・置換・挿入・脱落の率を求め、1行分の結果としてまとめる
     comparison = compare_texts(predicted_text, ground_truth)
 
     return {
@@ -249,6 +270,7 @@ def run_evaluation(
     rows: list[dict] = []
     for number, sound_path, text_path in pairs:
         print(f"[{number}] {sound_path.name} を処理中...")
+        # 1件でエラーが起きても全体を止めず、その行を空欄で記録して次に進む(数十分かかる処理のため)
         try:
             row = evaluate_pair(sound_path, text_path, models_dir=models_dir, top_k=top_k, preprocess=preprocess)
         except Exception as exc:  # noqa: BLE001 - バッチ処理を止めず記録して続行する

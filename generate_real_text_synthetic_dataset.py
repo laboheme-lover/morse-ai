@@ -96,36 +96,46 @@ TIMING_JITTER = 0.10  # generate_dataset.pyの1文字サンプル生成と同じ
 
 def parse_master_text(path: str | Path) -> list[tuple[str, int, str]]:
     """修正版テキストを (カテゴリ, 電文番号, 本文) のリストへ分割する。"""
+    # 修正版テキストの書式(例):
+    #   ■ 一・二総通：...(p.8〜9／音源 1-01)   ← カテゴリの見出し。「1-01」を取り出す
+    #   【電文01】                                ← 電文の始まり
+    #   一三三　アタミマルチヨウシムセン …         ← 本文(画面の幅で折り返されているだけ)
+    #   (空行)
+    #   【電文02】 …
+    #   (以上)                                    ← 文書の終わり
+    # 1行ずつ読み、見出し・電文番号・本文を振り分ける。utf-8-sig はファイル先頭のBOMを読み飛ばす指定。
     text = Path(path).read_text(encoding="utf-8-sig")
     category = ""
     messages: list[tuple[str, int, str]] = []
-    current_lines: list[str] | None = None
+    current_lines: list[str] | None = None  # 今読んでいる電文の本文の行(None = 電文の外)
     current_number: int | None = None
 
     def flush() -> None:
+        # 読みかけの電文があれば、本文の行をつなげて1件として確定する。
+        # 改行は表示上の折り返しなので、間に空白を入れずにそのままつなげる。
         if current_number is not None and current_lines is not None:
             messages.append((category, current_number, "".join(current_lines)))
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         header_match = HEADER_RE.search(line)
-        if header_match:
+        if header_match:  # 新しいカテゴリの見出し
             flush()
             category = header_match.group(1)
             current_lines = None
             current_number = None
             continue
         marker_match = MESSAGE_MARKER_RE.match(line)
-        if marker_match:
+        if marker_match:  # 【電文NN】: 前の電文を確定し、新しい電文を始める
             flush()
             current_number = int(marker_match.group(1))
             current_lines = []
             continue
         if line == "" or line == "(以上)" or line == "（以上）":
-            continue
+            continue  # 空行と文書の終わりの印は本文に含めない
         if current_lines is not None:
-            current_lines.append(line)
-    flush()
+            current_lines.append(line)  # 本文の行
+    flush()  # 最後の電文を確定する
     return messages
 
 
@@ -136,9 +146,14 @@ def normalize_message_text(raw_text: str) -> tuple[str, list[str]]:
     """
     import unicodedata
 
+    # (1) 漢数字を算用数字に置き換える(例「一三三」→「133」)。表に無い文字はそのまま。
     converted = "".join(KANJI_DIGIT.get(ch, ch) for ch in raw_text)
+    # (2) 全角の括弧「（）」などを半角にそろえる
     normalized = unicodedata.normalize("NFKC", converted)
+    # (3) 語群の区切りの全角スペースを除く
     no_space = "".join(ch for ch in normalized if not ch.isspace())
+    # (4) 符号で表せない文字(」・括弧)を除き、除いた文字は記録用に返す。
+    #     ここで除いておかないと、音声生成(char_to_units)で未対応文字のエラーになる。
     filtered = "".join(ch for ch in no_space if is_supported(ch))
     excluded = sorted({ch for ch in no_space if not is_supported(ch)})
     return filtered, excluded
@@ -154,9 +169,12 @@ def generate_message_wav(
     """1電文分の連続音声WAVを、学習データ生成と同じ手続きで合成する。"""
     rng = np.random.default_rng(seed)
 
+    # (1) 学習データと同じ規則で生成条件を抽選する。ただし電文1つにつき1回だけ
+    #     (1回の送信の中では速度・周波数・音量は一定)。
     speed = str(rng.choice(sorted(SPEED_RANGES)))
     params = resolve_generation_params(rng, speed=speed, randomize=True)
 
+    # (2) 電文全体を1本の連続音声にする(文字の間は7単位の無音)
     waveform = sequence_to_waveform(
         text,
         dot_duration=params["dot_duration"],
@@ -168,14 +186,17 @@ def generate_message_wav(
         ramp_seconds=params["ramp_seconds"],
     )
 
+    # (3) ノイズの種類を学習データと同じ比率で抽選する(なし20%・ホワイト40%・環境音40%)
     noise_type = _sample_noise_type(rng, esc50_available)
     snr_db: float | None = None
     esc50_fields = {"esc50_filename": "", "esc50_category": "", "esc50_fold": "", "esc50_src_file": ""}
 
+    # (4) ホワイトノイズなら、ここで音声全体に足す
     if noise_type == "white":
         snr_db = float(rng.choice(SNR_LEVELS_DB))
         waveform = add_white_noise(waveform, snr_db, rng)
 
+    # (5) -1〜+1 に収めて保存する(generate_morse_wav と同じ正規化)
     peak = float(np.max(np.abs(waveform))) if waveform.size > 0 else 0.0
     if peak > 1.0:
         waveform = waveform / peak
@@ -184,6 +205,8 @@ def generate_message_wav(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(output_path, waveform, SAMPLE_RATE, subtype="PCM_16")
 
+    # (6) 環境音なら、保存した音声に環境音を混ぜて上書きする。
+    #     評価専用のデータなので、学習では使っていないテスト用の fold5 の環境音だけを使う。
     if noise_type == "esc50":
         snr_db = float(rng.choice(SNR_LEVELS_DB))
         esc50_seed = int(rng.integers(0, 2**31 - 1))
@@ -225,20 +248,25 @@ def generate_real_text_synthetic_dataset(
     esc50_root = Path(esc50_root)
     esc50_available = (esc50_root / "meta" / "esc50.csv").exists()
 
+    # (1) 修正版テキストを20電文に分ける
     messages = parse_master_text(master_text)
     print(f"電文数: {len(messages)}")
 
+    # 全体のシード(既定42)から電文ごとのシードを順に引く。同じシードなら毎回同じデータになる。
     master_rng = np.random.default_rng(seed)
     rows: list[dict] = []
 
     for category, number, raw_text in messages:
+        # (2) 本文を音声にできる文字だけにそろえる
         synth_text, excluded = normalize_message_text(raw_text)
         wav_path = output_root / "wav" / category / f"{category}_電文{number:02d}.wav"
         text_path = output_root / "text" / category / f"{category}_電文{number:02d}.txt"
 
+        # (3) 電文1つ分の音声を合成する
         seed_i = int(master_rng.integers(0, 2**31 - 1))
         meta = generate_message_wav(synth_text, wav_path, esc50_root, esc50_available, seed_i)
 
+        # (4) 合成に使った本文をそのまま正解テキストとして保存する(音声と1対1で対応する)
         text_path.parent.mkdir(parents=True, exist_ok=True)
         text_path.write_text(synth_text, encoding="utf-8")
 

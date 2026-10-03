@@ -32,8 +32,10 @@ def compute_frame_rms(
     y: np.ndarray, sample_rate: int = SAMPLE_RATE, frame_ms: float = DEFAULT_FRAME_MS
 ) -> tuple[np.ndarray, int]:
     """フレーム単位のRMSエネルギー系列を計算する。戻り値は (RMS系列, フレーム長[サンプル])。"""
-    frame_length = max(int(round(sample_rate * frame_ms / 1000)), 1)
-    n_frames = int(np.ceil(len(y) / frame_length)) if len(y) > 0 else 0
+    # 音声を5ミリ秒ずつの小区間(フレーム)に区切り、各フレームの「音の強さ」を求める。
+    # RMS(二乗平均の平方根)= 波形の振幅の平均的な大きさ。音が鳴っていれば大きく、無音なら0に近い。
+    frame_length = max(int(round(sample_rate * frame_ms / 1000)), 1)  # 16kHzで5ms = 80サンプル
+    n_frames = int(np.ceil(len(y) / frame_length)) if len(y) > 0 else 0  # 端数も1フレームとして数える
     rms = np.zeros(n_frames, dtype=np.float64)
     for i in range(n_frames):
         chunk = y[i * frame_length : (i + 1) * frame_length].astype(np.float64)
@@ -69,14 +71,19 @@ def _despike_active_frames(active: np.ndarray, min_run_frames: int) -> np.ndarra
     result = active.copy()
     n = len(result)
     i = 0
+    # 例(min_run_frames=3、T=有音 F=無音): F F F F T F F F F → 2フレーム目以降の「T」が1フレームだけの
+    # 孤立したスパイクなので直前の F で塗りつぶし、F F F F F F F F F にする。
     while i < n:
+        # i から同じ値(有音 or 無音)が続く範囲 [i, j) を探す
         j = i
         while j < n and result[j] == result[i]:
             j += 1
         run_len = j - i
+        # その範囲が短すぎれば(3フレーム=15ms未満)、雑音による誤判定とみなして直前の状態で塗りつぶす。
+        # 最も速い短点でも50ms(10フレーム)あるので、本物の短点が消えることはない。
         if run_len < min_run_frames and i > 0:
             result[i:j] = result[i - 1]
-        i = j
+        i = j  # 次の範囲へ進む
     return result
 
 
@@ -102,29 +109,40 @@ def detect_active_frames_hysteresis(
     その上でdespike_min_run_frames(既定3フレーム=15ms)未満の孤立した
     短い区間を_despike_active_framesで除去する。1(以下)を指定すると無効化できる。
     """
+    # しきい値は「この音声の一番強いフレームの何%か」で決める(音量が違う音声でも同じ基準で扱える)。
+    # 既定では、オンになる条件 = ピークの25%を超える、オフになる条件 = ピークの12.5%を下回る。
     peak = float(rms.max()) if rms.size > 0 else 0.0
     high = peak * high_ratio
     low = peak * low_ratio
     active = np.zeros(rms.shape, dtype=bool)
-    state = False
+    state = False  # 最初は無音から始める
     for i, value in enumerate(rms):
+        # 今オンなら「低いしきい値を上回っている間はオンのまま」、
+        # 今オフなら「高いしきい値を超えたらオンにする」。
+        # 部屋の温度調整(暑くなったら冷房オン、十分冷えるまでオフにしない)と同じ考え方。
         state = (value > low) if state else (value > high)
         active[i] = state
+    # 注意: 雑音が無音区間にも乗り、その強さが「低いしきい値」を常に上回ると、一度オンになったきり
+    # オフに戻らず音声全体が1区間になる。これは前処理のバンドパスフィルタで雑音を減らして防ぐ
+    # (audio_preprocessing.py / 最終確認データの検証で判明した弱点)。
     return _despike_active_frames(active, despike_min_run_frames)
 
 
 def frames_to_runs(is_active: np.ndarray, frame_length: int, total_samples: int) -> list[tuple[int, int, bool]]:
     """フレーム単位の有音/無音フラグを、連続するサンプル区間(開始,終了,有音か)のリストへまとめる。"""
+    # 例: [T,T,F,F,F,T] (フレーム長10) → [(0,20,有音), (20,50,無音), (50,60,有音)]
+    # 値が切り替わるたびに、それまでの範囲を1つの区間として記録する。位置はサンプル番号に換算する。
     if is_active.size == 0:
         return []
     runs: list[tuple[int, int, bool]] = []
     start_frame = 0
     current = bool(is_active[0])
     for i in range(1, len(is_active)):
-        if bool(is_active[i]) != current:
+        if bool(is_active[i]) != current:  # 有音⇔無音が切り替わった
             runs.append((start_frame * frame_length, i * frame_length, current))
             start_frame = i
             current = bool(is_active[i])
+    # 最後の区間は音声の終わり(total_samples)までとする(端数のフレームがはみ出さないように)
     runs.append((start_frame * frame_length, total_samples, current))
     return runs
 
@@ -149,6 +167,7 @@ def split_into_characters(
     有音判定を行い、トーン中の瞬間的な落ち込みによる過分割を抑える。
     Falseにすると単一しきい値のdetect_active_framesを使う(従来の挙動)。
     """
+    # (1) 5msごとの音の強さ → 有音/無音の判定 → 「有音の区間」「無音の区間」の並びにする
     rms, frame_length = compute_frame_rms(y, sample_rate, frame_ms)
     if use_hysteresis:
         low_ratio = hysteresis_low_ratio if hysteresis_low_ratio is not None else threshold_ratio * 0.5
@@ -160,21 +179,31 @@ def split_into_characters(
     min_gap_samples = int(round(min_char_gap_seconds * sample_rate))
     padding_samples = int(round(padding_seconds * sample_rate))
 
+    # (2) 区間を先頭から順に見て、文字ごとにまとめる。
+    #   有音区間                      → 今の文字の一部として、文字の終わりを延ばす
+    #   短い無音(しきい値未満)        → 短点・長点の間の間隔なので、同じ文字のまま続ける
+    #   長い無音(しきい値以上)        → 文字の区切り。ここまでを1文字として確定する
+    # しきい値(min_char_gap_seconds)が音声の速度に合っていないと、長すぎれば複数の文字が
+    # 1文字にくっつき、短すぎれば1文字がばらばらに分かれる。アプリでは短点の長さを測って
+    # その1.8倍を自動で使う(app.py の「文字間隔しきい値を自動推定する」)。
     char_ranges: list[tuple[int, int]] = []
-    current_start: int | None = None
+    current_start: int | None = None  # 今まとめている文字の開始位置(None = 文字の外)
     current_end: int | None = None
     for start, end, is_on in runs:
         if is_on:
             if current_start is None:
-                current_start = start
+                current_start = start  # 新しい文字の始まり
             current_end = end
         elif current_start is not None and (end - start) >= min_gap_samples:
-            char_ranges.append((current_start, current_end))
+            char_ranges.append((current_start, current_end))  # 1文字分を確定
             current_start = None
             current_end = None
         # 短い無音(符号内の間隔)はそのまま同じ文字として継続する
     if current_start is not None:
+        # 音声の最後の文字(後ろに長い無音が無くても確定させる)
         char_ranges.append((current_start, current_end))
+
+    # (3) 前後に余白を付けて返す(既定は余白0。音声の範囲からはみ出さないように切り詰める)
 
     return [
         (max(0, start - padding_samples), min(len(y), end + padding_samples)) for start, end in char_ranges

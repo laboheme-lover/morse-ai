@@ -78,10 +78,16 @@ def assign_splits(n_samples: int, rng: np.random.Generator) -> list[str]:
     偏らないようにする。
     """
     splits = list(SPLIT_RATIOS.keys())
+    # (1) 比率どおりの理想の件数(小数)を計算し、まず切り捨てた件数を割り当てる。
+    #     例 n=300: train 210.0 / validation 45.0 / test 45.0 → ちょうど割り切れる
+    #     例 n=10 : train 7.0 / validation 1.5 / test 1.5 → 切り捨てで 7/1/1、1件余る
     exact = {s: n_samples * SPLIT_RATIOS[s] for s in splits}
     counts = {s: int(np.floor(exact[s])) for s in splits}
-    remainder = n_samples - sum(counts.values())
+    remainder = n_samples - sum(counts.values())  # 切り捨てで余った件数
 
+    # (2) 余りは「小数部分が大きい split」から順に1件ずつ配る(最大剰余法)。
+    #     小数部分が同じ split 同士(上の例の validation と test)は、順番を乱数で決める。
+    #     固定順だと全クラスで余りが常に同じ split に行き、件数が偏るため。
     fractional = {s: round(exact[s] - counts[s], 9) for s in splits}
     ordered = sorted(splits, key=lambda s: fractional[s], reverse=True)
     priority: list[str] = []
@@ -100,6 +106,8 @@ def assign_splits(n_samples: int, rng: np.random.Generator) -> list[str]:
                 counts[donor] -= 1
                 counts[split] += 1
 
+    # (3) ["train","train",...,"validation",...,"test",...] の並びを作ってシャッフルする。
+    #     i番目のサンプルがどの split に入るかを表すラベルの列になる。
     labels: list[str] = []
     for split, count in counts.items():
         labels.extend([split] * count)
@@ -108,12 +116,14 @@ def assign_splits(n_samples: int, rng: np.random.Generator) -> list[str]:
 
 
 def _sample_noise_type(rng: np.random.Generator, esc50_available: bool) -> str:
+    # ノイズの種類を NOISE_TYPE_WEIGHTS の比率(なし20%・ホワイト40%・環境音40%)で抽選する。
+    # ESC-50 が無い環境では環境音を候補から外し、残りの比率を合計1になるよう割り直す(なし1/3・ホワイト2/3)。
     weights = dict(NOISE_TYPE_WEIGHTS)
     if not esc50_available:
         weights.pop("esc50", None)
     types = list(weights.keys())
     probs = np.array(list(weights.values()), dtype=float)
-    probs /= probs.sum()
+    probs /= probs.sum()  # 合計が1になるよう正規化
     return str(rng.choice(types, p=probs))
 
 
@@ -126,8 +136,12 @@ def _generate_one_sample(
     esc50_root: Path,
     rng: np.random.Generator,
 ) -> dict:
+    # このサンプル専用のシードを、全体の乱数生成器から1つ引く。
+    # 全体のシード(例 42)が同じなら、全サンプルのシードも同じ順に決まり、データセット全体が再現できる。
     seed_i = int(rng.integers(0, 2**31 - 1))
 
+    # どのノイズでも、速度は指定のカテゴリ・周波数/音量/立ち上がりはランダム(randomize=True)・
+    # タイミングの揺らぎ±10%(timing_jitter=0.10)で生成する。
     if noise_type == "clean":
         _, meta = generate_morse_wav(label, wav_path, speed=speed, randomize=True, timing_jitter=0.10, seed=seed_i)
         meta.update(ESC50_EMPTY_FIELDS)
@@ -139,6 +153,8 @@ def _generate_one_sample(
         )
         meta.update(ESC50_EMPTY_FIELDS)
     elif noise_type == "esc50":
+        # 環境音は2段階: まずノイズなしの音声を作って保存し、
+        # それを読み直して同じ split の fold の環境音を混ぜ、同じパスに上書きする。
         _, clean_meta = generate_morse_wav(label, wav_path, speed=speed, randomize=True, timing_jitter=0.10, seed=seed_i)
         snr_db = float(rng.choice(SNR_LEVELS_DB))
         _, esc50_meta = mix_wav_with_esc50(
@@ -177,16 +193,24 @@ def generate_dataset(
     target = labels if labels is not None else target_labels()
     rows: list[dict] = []
 
+    # 全63文字それぞれについて samples_per_class 件(本番は300件)ずつ作る。
     for label in target:
+        # この文字の各サンプルを train/validation/test のどれに入れるかを先に決める
+        # (文字ごとに70/15/15になるので、どの split にも全文字が同じ比率で入る)
         splits = assign_splits(samples_per_class, rng)
         for i, split in enumerate(splits):
+            # 1サンプルごとに速度カテゴリ(slow/normal/fastを等確率)とノイズの種類を抽選する
             speed = str(rng.choice(sorted(SPEED_RANGES)))
             noise_type = _sample_noise_type(rng, esc50_available)
 
+            # 保存先: data/dataset/<split>/<文字>/<文字>_<split>_<番号>.wav
             wav_path = output_root / split / label / f"{label}_{split}_{i:03d}.wav"
             meta = _generate_one_sample(label, split, wav_path, speed, noise_type, esc50_root, rng)
+            # metadata.csv の列だけを取り出して1行にする(無い列は空欄)
             rows.append({field: meta.get(field, "") for field in METADATA_FIELDS})
 
+    # 全サンプルの生成条件を metadata.csv に書く。学習(morse_dataset.py)はこのCSVを読んで
+    # ファイルの場所・正解の文字・split を知る。毎回上書きするので古い行は残らない。
     with open(metadata_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=METADATA_FIELDS)
         writer.writeheader()

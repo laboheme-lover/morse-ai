@@ -19,6 +19,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# なぜ fold で分けるのか:
+#   同じ環境音(例: 同じ犬の鳴き声)が学習データとテストデータの両方に混ざると、
+#   モデルが「その雑音」を覚えてしまい、テストの成績が実力より良く見える(リーク)。
+#   ESC-50 は元音源が同じクリップを同じ fold にまとめてあるので、fold単位で分ければ防げる。
+#   学習用の音声の split(train/validation/test)と、混ぜる環境音の split を必ず一致させる。
 TRAIN_FOLDS: tuple[int, ...] = (1, 2, 3)
 VAL_FOLDS: tuple[int, ...] = (4,)
 TEST_FOLDS: tuple[int, ...] = (5,)
@@ -53,15 +58,18 @@ class Esc50Manager:
                 "https://github.com/karolpiczak/ESC-50 からダウンロードし、"
                 f"{self.root_dir} に展開してください。"
             )
+        # esc50.csv の1行 = 1クリップ。列: filename, fold, target, category, esc10, src_file, take
         self.meta = pd.read_csv(meta_path)
-        self.audio_dir = self.root_dir / "audio"
+        self.audio_dir = self.root_dir / "audio"  # WAVファイル本体の置き場所
 
     def clips_for_split(self, split: str) -> list[Esc50Clip]:
         """指定したsplit(train/validation/test)に属する全クリップを返す。"""
         if split not in SPLIT_FOLDS:
             raise ValueError(f"未対応のsplitです: {split!r} (選択肢: {sorted(SPLIT_FOLDS)})")
         folds = SPLIT_FOLDS[split]
+        # fold 列が指定の fold のいずれかに含まれる行だけを取り出す(例 train → fold 1,2,3 の1200件)
         rows = self.meta[self.meta["fold"].isin(folds)]
+        # 1行ずつ Esc50Clip(読み取り専用の小さなデータ入れ物)に詰め替えて返す
         return [
             Esc50Clip(
                 filename=str(row["filename"]),
@@ -79,6 +87,7 @@ class Esc50Manager:
         clips = self.clips_for_split(split)
         if not clips:
             raise ValueError(f"split={split!r} に該当するESC-50クリップがありません")
+        # 0 〜 クリップ数-1 の整数を乱数で1つ選ぶ。rng を渡せば選び方も再現できる。
         index = int(rng.integers(0, len(clips)))
         return clips[index]
 

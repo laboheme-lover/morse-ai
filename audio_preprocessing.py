@@ -83,26 +83,33 @@ def estimate_center_frequency(
     """
     if y.size == 0:
         return fallback
+    # (1) 音が鳴っている区間を探す(区間分割と同じ判定方法)。短すぎる区間(32サンプル=2ms未満)は除く。
     rms, frame_length = compute_frame_rms(y, sample_rate, frame_ms)
     active = detect_active_frames_hysteresis(rms, high_ratio=threshold_ratio, low_ratio=threshold_ratio * 0.5)
     runs = frames_to_runs(active, frame_length, len(y))
     on_runs = [(start, end) for start, end, is_on in runs if is_on]
     on_runs = [(start, end) for start, end in on_runs if end - start >= 32]
     if not on_runs:
-        return fallback
+        return fallback  # 音が見つからなければ既定値(700Hz)
 
+    # (2) 長い順に最大5区間を選ぶ(長いほど周波数を細かく測れる)。
+    #     スペクトルを足し合わせるには周波数の目盛りをそろえる必要があるので、一番短い区間の長さに切りそろえる。
     on_runs.sort(key=lambda r: r[1] - r[0], reverse=True)
     selected = on_runs[:max_runs]
     common_length = min(end - start for start, end in selected)
+    # ハニング窓: 区間の両端をなだらかに0へ近づける重み。区間を途中で切ったことによる
+    # 偽の周波数成分(漏れ)を抑え、ピークを鋭くする。
     window = np.hanning(common_length)
 
+    # (3) 各区間をFFT(フーリエ変換)して「どの周波数がどれだけ含まれるか」を求め、足し合わせる
     aggregate_spectrum: np.ndarray | None = None
     for start, end in selected:
         segment = y[start : start + common_length]
-        spectrum = np.abs(np.fft.rfft(segment * window))
+        spectrum = np.abs(np.fft.rfft(segment * window))  # 各周波数の強さ
         aggregate_spectrum = spectrum if aggregate_spectrum is None else aggregate_spectrum + spectrum
 
-    freqs = np.fft.rfftfreq(common_length, d=1.0 / sample_rate)
+    # (4) 一番強い周波数 = トーンの周波数
+    freqs = np.fft.rfftfreq(common_length, d=1.0 / sample_rate)  # 各要素が何Hzに当たるか
     # 直流・低周波成分(0-100Hz)を除外して基本波のピークを探す
     valid = freqs > 100.0
     if not np.any(valid):
@@ -124,6 +131,9 @@ def estimate_dot_seconds(
     固定しきい値では送信速度の異なる実録音に対応できないため、ファイルごとに
     実際の短点長を推定する。
     """
+    # 音が鳴っている区間の長さを全部集める。中身は短点(1単位)と長点(3単位)が混ざっているので、
+    # 短いほうから15%の位置の値(15パーセンタイル)を短点の長さとみなす。
+    # 最小値を使わないのは、雑音による極端に短い区間に引きずられないようにするため。
     rms, frame_length = compute_frame_rms(y, sample_rate, frame_ms)
     active = detect_active_frames_hysteresis(rms, high_ratio=threshold_ratio, low_ratio=threshold_ratio * 0.5)
     runs = frames_to_runs(active, frame_length, len(y))
@@ -142,6 +152,8 @@ def estimate_char_gap_seconds(
     fallback: float = DEFAULT_GAP_FALLBACK_SECONDS,
 ) -> float:
     """無音(オフ)区間の分布(上位寄りpercentile)から文字境界の間隔を推定する。"""
+    # 無音の区間の長さを集め、長いほうから15%の位置(85パーセンタイル)を文字の区切りの間隔とみなす。
+    # 無音は「符号内の短い間隔」が大半で、「文字の区切りの長い間隔」はそれより少ないため。
     rms, frame_length = compute_frame_rms(y, sample_rate, frame_ms)
     active = detect_active_frames_hysteresis(rms, high_ratio=threshold_ratio, low_ratio=threshold_ratio * 0.5)
     runs = frames_to_runs(active, frame_length, len(y))
@@ -173,12 +185,19 @@ def bandpass_filter(
     """検出したトーン周波数付近だけを通すバンドパスフィルタ(倍音・帯域外ノイズを抑える)。"""
     if y.size == 0:
         return y.astype(np.float32)
+    # 通す範囲 = トーン周波数 ± 150Hz(例 600Hz なら 450〜750Hz)。それ以外の周波数の音を弱める。
+    # ホワイトノイズは全周波数に広がっているので、この範囲だけ通すと雑音の大部分を取り除ける。
+    # 周波数は「ナイキスト周波数(サンプリング周波数の半分=8000Hz)に対する比率」で指定する決まり。
     nyquist = sample_rate / 2.0
     low = max(1.0, center_freq_hz - halfwidth_hz) / nyquist
     high = min(nyquist - 1.0, center_freq_hz + halfwidth_hz) / nyquist
     if not (0 < low < high < 1):
-        return y.astype(np.float32)
+        return y.astype(np.float32)  # 範囲が不正なら何もしない
+    # 4次のバターワース型フィルタ(通す範囲の中はできるだけ平らに通す型)を設計する。
+    # sos 形式 = 2次のフィルタを直列につないだ表現。高次でも計算誤差が出にくい。
     sos = butter(order, [low, high], btype="bandpass", output="sos")
+    # sosfiltfilt: 前から1回・後ろから1回かけて、フィルタによる時間のずれを打ち消す。
+    # 音の始まり・終わりの位置がずれると区間分割の位置もずれるため。
     filtered = sosfiltfilt(sos, y)
     return filtered.astype(np.float32)
 
@@ -187,9 +206,10 @@ def normalize_amplitude(y: np.ndarray, target_peak: float = DEFAULT_TARGET_PEAK_
     """振幅を学習データに近い水準(ピーク基準)へ正規化する。"""
     if y.size == 0:
         return y.astype(np.float32)
+    # 一番大きい振幅が target_peak(0.7)になるよう、全体を同じ倍率で拡大・縮小する
     peak = float(np.max(np.abs(y)))
     if peak <= 1e-9:
-        return y.astype(np.float32)
+        return y.astype(np.float32)  # ほぼ無音なら何もしない(0で割らないため)
     return (y * (target_peak / peak)).astype(np.float32)
 
 
@@ -235,9 +255,12 @@ def preprocess_for_inference(
     影響が大きいためデフォルトでは無効。必要な場合のみapply_time_stretch=Trueで
     有効化できる。戻り値は (前処理後の波形, 測定した音響特性) のタプル。
     """
+    # (1) まず元の音声から、トーン周波数・短点の長さなどを測る
     analysis = analyze_audio(y, sample_rate)
     processed = y.astype(np.float32)
 
+    # (2) 測ったトーン周波数の付近だけを通す(雑音を減らす)。
+    #     雑音の多い音声では区間分割が成功するかどうかを左右するので、アプリでは既定でON。
     if apply_bandpass:
         processed = bandpass_filter(processed, sample_rate, analysis.frequency_hz, bandpass_halfwidth_hz)
     if apply_time_stretch:

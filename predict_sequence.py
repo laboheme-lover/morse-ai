@@ -78,12 +78,15 @@ def build_display_units(sequence: SequencePrediction, low_confidence_threshold: 
     units: list[DisplayUnit] = []
     chars = sequence.characters
     i = 0
+    # morse_table.compose_dakuten() と同じ「今と次の2区間が (基本仮名, 濁点) なら1文字に結合」の考え方。
+    # 文字列だけでなく、各区間の位置(音声の何秒目か)と確信度も対応付けたまま結合するため、別に実装している。
     while i < len(chars):
         current = chars[i].result
         if i + 1 < len(chars):
             following = chars[i + 1].result
             composed = compose_pair(current.prediction, following.prediction)
             if composed is not None:
+                # 「ガ」の確信度は「カ」と「゛」のうち低いほう(どちらかが怪しければ全体も怪しい)
                 confidence = min(current.confidence, following.confidence)
                 units.append(DisplayUnit(composed, confidence, [i, i + 1], confidence < low_confidence_threshold))
                 i += 2
@@ -113,14 +116,19 @@ def predict_sequence_from_waveform(
     モデルを読み込み済みの状態で繰り返し推論できるため、Streamlit UIのように
     しきい値等を変えながら何度も認識する用途に向く。
     """
+    # 連続音声認識の2段構え:
+    # (1) 区間分割: 無音を手掛かりに音声を1文字ずつの区間 [(開始, 終了), ...] に区切る
     ranges = split_into_characters(y, sr, min_char_gap_seconds, frame_ms, threshold_ratio, padding_seconds)
 
+    # (2) 文字判定: 各区間を切り出してモデルで1文字ずつ推論する。
+    #     学習データは「1文字=1つの音声」なので、同じ形に切り出してから渡す。
     characters: list[CharacterPrediction] = []
     for start, end in ranges:
         chunk = y[start:end]
         result = predict_waveform(chunk, model, index_to_label, fixed_frames, sr, device, top_k)
         characters.append(CharacterPrediction(start, end, sr, result))
 
+    # 予測した文字をつなげて文字列にする(この時点では濁音は「カ゛」のまま。表示時に結合する)
     text = "".join(c.result.prediction for c in characters)
     return SequencePrediction(text=text, characters=characters)
 

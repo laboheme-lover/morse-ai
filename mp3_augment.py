@@ -18,6 +18,12 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
+# 【現在の使われ方】
+#   このモジュールは test_mp3_augment.py 以外からは呼ばれておらず、学習データの生成
+#   (generate_dataset.py)には組み込まれていない。実録音との差の原因調査として、合成音を
+#   MP3往復させて現行モデルの精度を比べたところ、低ビットレート(48kbps)以外ではほぼ影響が
+#   無かったため、データ生成への組み込みは見送った。必要になったときに使える部品として残している。
+
 # MP3の符号化サンプリング周波数。実録音は44.1kHzだったので合わせる。
 CODEC_SAMPLE_RATE = 44100
 
@@ -27,6 +33,8 @@ COMPRESSION_LEVELS: tuple[float, ...] = (0.4, 0.6, 0.8, 0.95)  # 約192/160/96/4
 
 
 def _resample(y: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+    # サンプリング周波数を変換する。16000→44100Hz なら 最大公約数100で割って「441倍に増やして160で割る」。
+    # resample_poly は整数比の変換を、折り返し雑音を防ぐフィルタ付きで行う。
     if from_rate == to_rate:
         return y
     divisor = gcd(from_rate, to_rate)
@@ -47,7 +55,9 @@ def mp3_roundtrip(
     if waveform.size == 0:
         return waveform.astype(np.float32)
 
+    # (1) 16kHz → 44.1kHz に変換する(実録音と同じ条件でMP3にするため)
     upsampled = _resample(waveform.astype(np.float32), sample_rate, codec_sample_rate)
+    # (2) ファイルを作らず、メモリ上(BytesIO)でMP3に圧縮する
     buffer = io.BytesIO()
     sf.write(
         buffer,
@@ -58,11 +68,13 @@ def mp3_roundtrip(
         bitrate_mode="CONSTANT",
         compression_level=compression_level,
     )
+    # (3) メモリ上のMP3を先頭から読み戻す(復号)。ステレオで返ってきたら左右を平均してモノラルにする
     buffer.seek(0)
     decoded, decoded_rate = sf.read(buffer, dtype="float32")
     if decoded.ndim > 1:
         decoded = decoded.mean(axis=1)
 
+    # (4) 元のサンプリング周波数に戻し、長さを元と同じにそろえる(長ければ切る、短ければ0で埋める)
     restored = _resample(decoded, decoded_rate, sample_rate)
     if len(restored) >= len(waveform):
         return restored[: len(waveform)].astype(np.float32)

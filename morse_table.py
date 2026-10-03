@@ -8,6 +8,24 @@
 
 from __future__ import annotations
 
+# ============================================================================
+# このモジュールの役割
+#   プロジェクト全体の「語彙(認識できる文字の一覧)」と「文字⇔符号の対応」を
+#   一か所で定義する。音声の生成(generate_morse_audio.py)・データセットの
+#   クラス一覧(generate_dataset.py)・正解テキストの絞り込み(evaluate_real_samples.py)
+#   ・認識結果の表示(predict_sequence.py / app.py)がすべてここを参照するため、
+#   文字を追加するときはこのファイルだけを変えればよい(句点「。」もここで追加した)。
+#
+# 符号の表し方
+#   "." = 短点(トン、1単位)、"-" = 長点(ツー、3単位)。例: イ = ".-"(トン・ツー)
+#
+# 濁音・半濁音の扱い(重要な設計判断)
+#   和文モールスでは「ガ」は「カ」の符号のあとに「濁点」の符号を続けて送る。
+#   そのためモデルは「カ」と「゛」を別々の1文字として認識し、表示の直前に
+#   compose_dakuten() で「ガ」に結合する。これにより認識すべきクラス数は
+#   カタカナ48+記号5+数字10=63で済む(濁音・半濁音26文字を別クラスにしない)。
+# ============================================================================
+
 # 和文カタカナ 48字の基本符号(濁音・半濁音は含まない)
 WABUN_KANA_CODE: dict[str, str] = {
     "イ": ".-",
@@ -106,6 +124,8 @@ HANDAKUTEN_KANA: dict[str, str] = {
 }
 
 # 全ての「単一符号で送出できる文字」をまとめた符号表
+# (= モデルが認識するクラスの一覧。キーの数63がそのままクラス数になる)
+# 「**辞書」は辞書の中身を展開して1つの辞書にまとめるPythonの書き方。
 MORSE_CODE_TABLE: dict[str, str] = {
     **WABUN_KANA_CODE,
     **MARK_CODE,
@@ -113,11 +133,16 @@ MORSE_CODE_TABLE: dict[str, str] = {
 }
 
 # 符号 -> 文字 の逆引き表
+# 全63文字の符号が重複していないこと(1つの符号から1つの文字に決まること)は
+# test_morse_table.py の test_all_codes_are_unique で確認している。
 CODE_TO_CHAR: dict[str, str] = {code: ch for ch, code in MORSE_CODE_TABLE.items()}
 
 
 def is_supported(char: str) -> bool:
     """指定した1文字が符号表(濁音・半濁音の合成仮名を含む)で表現できるか判定する。"""
+    # 符号表にある63文字に加え、「基本仮名+濁点/半濁点」に分解できる合成仮名(ガ・パ等)も
+    # 送出可能なので対応文字とみなす。符号表のキーだけで判定すると「ガ」が未対応扱いになり、
+    # 実録音の正解テキストから濁音が抜け落ちる(実際に起きたバグ)ので注意。
     return char in MORSE_CODE_TABLE or char in DAKUTEN_KANA or char in HANDAKUTEN_KANA
 
 
@@ -127,14 +152,19 @@ def char_to_units(char: str) -> list[str]:
     通常の文字は要素1つのリストを返す。濁音・半濁音の合成仮名(ガ, パ 等)は
     基本仮名の符号と付加記号(濁点/半濁点)の符号の2要素に展開する。
     """
+    # 通常の文字(カタカナ・記号・数字): 符号1つ。例 "イ" -> [".-"]
     if char in MORSE_CODE_TABLE:
         return [MORSE_CODE_TABLE[char]]
+    # 濁音: 基本仮名の符号 + 濁点の符号。例 "ガ" -> [カの符号 ".-..", 濁点の符号 ".."]
     if char in DAKUTEN_KANA:
         base = DAKUTEN_KANA[char]
         return [WABUN_KANA_CODE[base], MARK_CODE[DAKUTEN_MARK]]
+    # 半濁音: 基本仮名の符号 + 半濁点の符号。例 "パ" -> [ハの符号, 半濁点の符号]
     if char in HANDAKUTEN_KANA:
         base = HANDAKUTEN_KANA[char]
         return [WABUN_KANA_CODE[base], MARK_CODE[HANDAKUTEN_MARK]]
+    # 漢字・英字・括弧など、和文モールスで送れない文字はエラーにする。
+    # 呼び出し側(音声生成など)は、事前に is_supported() で絞り込んでから呼ぶ。
     raise KeyError(f"未対応の文字です: {char!r}")
 
 
@@ -167,16 +197,20 @@ def compose_dakuten(text: str) -> str:
     (predict_sequence.py)の出力をそのまま表示すると「カ゛」のようになって
     しまう。この関数で通常の日本語表記(ガ)へ変換する。
     """
+    # 先頭から1文字ずつ見ていき、「今の文字」と「次の文字」が
+    # (基本仮名, 濁点/半濁点) の組になっていれば、1文字の合成仮名に置き換えて2文字進む。
+    # 例: "イカ゛ク" -> イ / (カ,゛)→ガ / ク -> "イガク"
     result: list[str] = []
     i = 0
     while i < len(text):
         ch = text[i]
-        if i + 1 < len(text):
+        if i + 1 < len(text):  # 次の文字がある場合だけ組を調べる
             composed = compose_pair(ch, text[i + 1])
             if composed is not None:
                 result.append(composed)
-                i += 2
+                i += 2  # 2文字(基本仮名+濁点)を1文字として消費する
                 continue
+        # 組にならなければそのまま残す。「ン゛」のように結合できない組も変えずに残す。
         result.append(ch)
         i += 1
     return "".join(result)

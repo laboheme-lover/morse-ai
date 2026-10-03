@@ -66,12 +66,16 @@ def evaluate_row(
     preprocess: bool,
     tmp_dir: Path,
 ) -> dict:
+    # 処理の流れは evaluate_real_samples.evaluate_pair と同じ。違いは、正解テキストが
+    # 合成時の本文そのもの(既に語彙で絞り込み済み)なので、正規化をしない点だけ。
     wav_path = Path(row["wav_path"])
     text_path = Path(row["text_path"])
     ground_truth = text_path.read_text(encoding="utf-8")
 
     y, sr = librosa.load(str(wav_path), sr=16000, mono=True)
 
+    # 前処理(トーン周波数付近だけを通すフィルタ)は既定でON。
+    # 雑音が無音部分にも乗るこのデータでは、前処理なしだと区間分割が崩れる(平均27.9%→前処理ありで68.2%)。
     if preprocess:
         processed_y, analysis = preprocess_for_inference(y, sr)
         measured_freq = analysis.frequency_hz
@@ -85,11 +89,13 @@ def evaluate_row(
         inference_path = wav_path
         dot_estimate = estimate_dot_seconds(y, sr)
 
+    # 文字の区切りのしきい値 = 測った短点の長さ × 1.8(アプリの自動推定と同じ規則)
     min_gap = max(min_gap_floor, dot_estimate * gap_multiplier)
 
     result = predict_sequence(inference_path, models_dir=models_dir, top_k=top_k, min_char_gap_seconds=min_gap)
     predicted_text = compose_dakuten(result.text)
 
+    # 前処理用に作った一時WAVを消す
     if preprocess and isinstance(inference_path, Path):
         inference_path.unlink(missing_ok=True)
 

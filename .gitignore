@@ -24,3 +24,7 @@ evaluation_*/*.csv
 .DS_Store
 .pytest_cache/
 morse-ai_transfer.zip
+
+# 実行ログ・Officeのロックファイル
+*.err
+~$*

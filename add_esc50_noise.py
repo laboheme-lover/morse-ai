@@ -37,10 +37,14 @@ def _fit_noise_length(noise: np.ndarray, target_length: int, rng: np.random.Gene
         return np.zeros(0, dtype=np.float32)
     if len(noise) == 0:
         return np.zeros(target_length, dtype=np.float32)
+    # 環境音のほうが長い場合(1文字の音声は1秒程度、ESC-50は5秒):
+    # ランダムな開始位置から必要な長さだけ切り出す。毎回同じ部分にならないようにするため。
     if len(noise) >= target_length:
         start = int(rng.integers(0, len(noise) - target_length + 1))
         return noise[start : start + target_length]
-    repeats = int(np.ceil(target_length / len(noise)))
+    # 環境音のほうが短い場合(数分ある電文の連続音声など):
+    # 環境音を何回か繰り返してつなげ(np.tile)、そこからランダムな位置で切り出す。
+    repeats = int(np.ceil(target_length / len(noise)))  # 必要な繰り返し回数(切り上げ)
     tiled = np.tile(noise, repeats)
     start = int(rng.integers(0, len(tiled) - target_length + 1))
     return tiled[start : start + target_length]
@@ -58,15 +62,20 @@ def mix_with_noise(
     トーン区間(振幅が0でないサンプル)の平均パワーを基準とする。
     """
     rng = rng if rng is not None else np.random.default_rng()
+    # (1) 環境音の長さをモールス音声と同じにそろえる
     noise = _fit_noise_length(noise, len(waveform), rng)
 
+    # (2) 信号の電力(音が鳴っている部分だけの二乗平均)と、環境音の電力を測る
     active = waveform[waveform != 0]
     signal_power = float(np.mean(active**2)) if active.size > 0 else 1e-12
     noise_power = float(np.mean(noise**2))
 
+    # (3) 指定SNRになるのに必要な環境音の電力を求め、環境音の音量を何倍すればよいかを計算する。
+    #     電力は振幅の2乗に比例するので、振幅の倍率は電力の比の平方根になる。
     snr_linear = 10 ** (snr_db / 10)
     target_noise_power = signal_power / snr_linear
     scale = np.sqrt(target_noise_power / noise_power) if noise_power > 0 else 0.0
+    # (4) 音量を合わせた環境音を足し合わせる(無音区間にも環境音が乗る)
     return waveform + noise * scale
 
 
@@ -83,13 +92,17 @@ def mix_wav_with_esc50(
     戻り値は (出力パス, 生成条件metadata辞書) のタプル。
     """
     rng = np.random.default_rng(seed)
+    # (1) 生成済みのモールス音声(ノイズなし)を読み込む
     waveform, sample_rate = sf.read(morse_wav_path)
     waveform = waveform.astype(np.float32)
 
+    # (2) 音声と同じ split の fold から環境音を1つ選び、モールス音声と同じサンプリング周波数で読み込む
+    #     (ESC-50は44100Hz、モールス音声は16000Hzなので変換が必要)
     manager = Esc50Manager(esc50_root)
     clip = manager.random_clip(split, rng)
     noise = load_esc50_clip(clip, sample_rate)
 
+    # (3) 指定SNRで混ぜる
     mixed = mix_with_noise(waveform, noise, snr_db, rng)
 
     # ホワイトノイズ付加時と同様、ハードクリップではなく一様スケーリングで正規化する。
@@ -97,10 +110,12 @@ def mix_wav_with_esc50(
     if peak > 1.0:
         mixed = mixed / peak
 
+    # (4) 保存する(generate_dataset.py からは入力と同じパスを渡して上書きしている)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(output_path, mixed.astype(np.float32), sample_rate, subtype="PCM_16")
 
+    # (5) どの環境音を使ったかを記録する(後から「環境音の種類別の正解率」などを調べられる)
     metadata = {
         "noise_type": "esc50",
         "snr_db": snr_db,

@@ -25,7 +25,25 @@ from morse_table import char_to_units
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-SAMPLE_RATE = 16000
+# ============================================================================
+# このモジュールの役割(ジェネレートモデル = 学習用の合成音声を作る生成器)
+#   モールス符号の規則どおりにトーン(正弦波)をオン・オフさせて音声を組み立てる。
+#   AIの生成モデルではなく、ルールベースの生成器。規則で作るので正解ラベルが確実に正しい。
+#
+# 時間の単位(和文・欧文モールス共通の規則)
+#   短点(トン) = 1単位、長点(ツー) = 3単位、
+#   符号内の間隔 = 1単位、文字と文字の間隔 = 3単位(本プロジェクトの連続音声では7単位)
+#   「1単位の長さ」= dot_duration(短点の長さ[秒])。これを変えると送信速度が変わる。
+#
+# 関数の階層(下から順に組み立てる)
+#   _tone / _silence             … 音1つ・無音1つ
+#   code_to_waveform(".-")       … 符号1つ(短点・長点の並び)
+#   char_to_waveform("ガ")       … 文字1つ(濁音は 基本仮名+濁点 の2符号)
+#   sequence_to_waveform("イロハ") … 文章(文字を文字間隔でつなぐ)
+#   generate_morse_wav           … 1文字を生成条件付きでWAV保存(学習データ用)
+# ============================================================================
+
+SAMPLE_RATE = 16000  # 1秒あたりのサンプル数。モールス信号(数百Hz〜1kHz)を表すには十分
 DEFAULT_FREQUENCY_HZ = 700.0
 DEFAULT_AMPLITUDE = 0.6
 DEFAULT_DOT_DURATION = 0.10  # 短点の長さ[秒] (normal速度相当)
@@ -86,24 +104,32 @@ def _tone(
     sample_rate: int,
     ramp_seconds: float = RAMP_SECONDS,
 ) -> np.ndarray:
+    # 指定した長さ・周波数・音量の正弦波(ピーという音)を1つ作る。短点・長点の「音」の部分。
+    # サンプル数 = 秒数 × サンプリング周波数(16000Hzなら1秒=16000サンプル)。最低1サンプルは作る。
     n_samples = max(int(round(duration_seconds * sample_rate)), 1)
-    t = np.arange(n_samples) / sample_rate
-    wave = amplitude * np.sin(2 * np.pi * frequency_hz * t)
+    t = np.arange(n_samples) / sample_rate  # 各サンプルの時刻[秒]
+    wave = amplitude * np.sin(2 * np.pi * frequency_hz * t)  # 振幅 × sin(2πft)
 
+    # 音の出だしと終わりを、ramp_seconds かけて直線的に大きく/小さくする(フェード)。
+    # いきなりオン/オフすると「プチッ」というクリック音(広い周波数のノイズ)が出るため。
+    # 実際の無線機も数msかけて立ち上がる(実録音は約2.3ms)。音が極端に短いときは長さの半分までに抑える。
     ramp_samples = min(int(round(ramp_seconds * sample_rate)), n_samples // 2)
     if ramp_samples > 0:
-        ramp = np.linspace(0.0, 1.0, ramp_samples)
-        wave[:ramp_samples] *= ramp
-        wave[-ramp_samples:] *= ramp[::-1]
+        ramp = np.linspace(0.0, 1.0, ramp_samples)  # 0→1 へ直線的に増える係数
+        wave[:ramp_samples] *= ramp  # 出だしをフェードイン
+        wave[-ramp_samples:] *= ramp[::-1]  # 終わりをフェードアウト(係数を逆順にする)
     return wave.astype(np.float32)
 
 
 def _silence(duration_seconds: float, sample_rate: int) -> np.ndarray:
+    # 指定した長さの無音(すべて0の配列)を作る。短点・長点の間や文字の間の「間(ま)」に使う。
     n_samples = max(int(round(duration_seconds * sample_rate)), 0)
     return np.zeros(n_samples, dtype=np.float32)
 
 
 def _jittered_duration(base_duration: float, timing_jitter: float, rng: np.random.Generator) -> float:
+    # 人間の手送りの揺らぎを模擬する。基準の長さに (1 ± timing_jitter) の範囲の
+    # ランダムな係数を掛ける。timing_jitter=0.10 なら ±10% の範囲で長さがばらつく。
     if timing_jitter <= 0:
         return base_duration
     factor = 1.0 + rng.uniform(-timing_jitter, timing_jitter)
@@ -125,18 +151,22 @@ def code_to_waveform(
         raise ValueError(f"timing_jitterは[0, 1)の範囲で指定してください: {timing_jitter!r}")
     rng = rng if rng is not None else np.random.default_rng()
 
+    # 符号の記号("." / "-")を1つずつ音に変換し、間に1単位の無音を挟んで並べる。
+    # 例 ".-"(イ): [トン(1単位)] [無音(1単位)] [ツー(3単位)]
     segments: list[np.ndarray] = []
     for i, symbol in enumerate(code):
         if i > 0:
+            # 2つ目以降の記号の前に、符号内の間隔(1単位)の無音を入れる
             gap = _jittered_duration(dot_duration * INTRA_CODE_GAP_UNITS, timing_jitter, rng)
             segments.append(_silence(gap, sample_rate))
         if symbol == ".":
-            duration = _jittered_duration(dot_duration, timing_jitter, rng)
+            duration = _jittered_duration(dot_duration, timing_jitter, rng)  # 短点 = 1単位
         elif symbol == "-":
-            duration = _jittered_duration(dot_duration * DASH_UNITS, timing_jitter, rng)
+            duration = _jittered_duration(dot_duration * DASH_UNITS, timing_jitter, rng)  # 長点 = 3単位
         else:
             raise ValueError(f"不正な符号記号です: {symbol!r}")
         segments.append(_tone(duration, frequency_hz, amplitude, sample_rate, ramp_seconds))
+    # 部品(音と無音の配列)を順につなげて1本の波形にする
     return np.concatenate(segments)
 
 
@@ -152,10 +182,12 @@ def char_to_waveform(
 ) -> np.ndarray:
     """1文字(濁音・半濁音の合成仮名を含む)を波形に変換する。"""
     rng = rng if rng is not None else np.random.default_rng()
+    # 文字を符号の列に分解する。通常の文字は1つ、濁音(ガ等)は「カ」+「濁点」の2つになる。
     units = char_to_units(char)
     segments: list[np.ndarray] = []
     for i, code in enumerate(units):
         if i > 0:
+            # 濁音の「基本仮名」と「濁点」の間には3単位の無音を入れる(文字と文字の間と同じ扱い)
             gap = _jittered_duration(dot_duration * INTER_CODE_GAP_UNITS, timing_jitter, rng)
             segments.append(_silence(gap, sample_rate))
         segments.append(
@@ -183,6 +215,8 @@ def sequence_to_waveform(
 ) -> np.ndarray:
     """複数文字を文字間隔(無音)で連結した連続音声の波形を生成する。"""
     rng = rng if rng is not None else np.random.default_rng()
+    # 文章を1文字ずつ波形にし、文字と文字の間に7単位の無音を挟んでつなげる。
+    # 速度・周波数・音量は文章全体で共通(1回の送信の中ではほぼ一定という実際の送信に合わせる)。
     segments: list[np.ndarray] = []
     for i, char in enumerate(text):
         if i > 0:
@@ -230,11 +264,17 @@ def add_white_noise(
     同じSNR指定でも聞こえ方が変わってしまうため、トーン区間のみを用いる。
     """
     rng = rng if rng is not None else np.random.default_rng()
+    # (1) 信号の電力 = 音が鳴っている部分(値が0でないサンプル)の二乗平均
     active = waveform[waveform != 0]
     signal_power = float(np.mean(active**2)) if active.size > 0 else 1e-12
 
+    # (2) SNR[dB] から、必要なノイズ電力を逆算する。
+    #     SNR[dB] = 10 × log10(信号電力 / ノイズ電力) なので、ノイズ電力 = 信号電力 / 10^(SNR/10)
+    #     例: SNR 0dB → ノイズ電力 = 信号電力(同じ強さ)。-5dB → ノイズが信号の約3.2倍。
     snr_linear = 10 ** (snr_db / 10)
     noise_power = signal_power / snr_linear
+    # (3) 平均0・標準偏差√ノイズ電力 の正規分布の乱数 = ホワイトノイズ(全周波数に均等な雑音)。
+    #     波形全体(無音部分も含む)に足す。実際の受信でも雑音は送信の合間にも鳴っている。
     noise = rng.normal(0.0, np.sqrt(noise_power), size=waveform.shape).astype(np.float32)
     return waveform + noise
 
@@ -253,6 +293,10 @@ def resolve_generation_params(
     明示的な指定があればそれを優先し、無ければ speed / randomize に応じて
     SPEED_RANGES・FREQUENCY_RANGE・AMPLITUDE_RANGE からランダムサンプリングする。
     """
+    # --- 速度(短点の長さ)の決め方 ---
+    #   1) dot_duration を直接指定 → それを使う(speed名は "custom")
+    #   2) speed も無指定 → normal の既定値 0.10秒
+    #   3) speed を指定 → その速度カテゴリの範囲から一様乱数で選ぶ(例 fast なら 0.05〜0.08秒)
     if dot_duration is not None:
         speed = speed or "custom"
     else:
@@ -262,8 +306,11 @@ def resolve_generation_params(
         else:
             if speed not in SPEED_RANGES:
                 raise ValueError(f"未対応のspeedです: {speed!r} (選択肢: {sorted(SPEED_RANGES)})")
-            dot_duration = rng.uniform(*SPEED_RANGES[speed])
+            dot_duration = rng.uniform(*SPEED_RANGES[speed])  # *で(下限, 上限)を2つの引数に展開
 
+    # --- 周波数・音量・立ち上がり時間 ---
+    # 指定があればそれを使い、無ければ randomize=True のときだけ範囲から乱数で選ぶ
+    # (False なら既定値で固定)。学習データ生成では常に randomize=True。
     if frequency_hz is None:
         frequency_hz = rng.uniform(*FREQUENCY_RANGE) if randomize else DEFAULT_FREQUENCY_HZ
     if amplitude is None:
@@ -305,9 +352,12 @@ def generate_morse_wav(
     if noise_type == "white" and snr_db is None:
         raise ValueError("noise_type='white' の場合は snr_db を指定してください")
 
+    # 乱数生成器をシードから作る。同じシードなら毎回まったく同じ音声ができる(再現性)。
     rng = np.random.default_rng(seed)
+    # (1) 生成条件(速度・周波数・音量・立ち上がり)を決める
     params = resolve_generation_params(rng, speed, dot_duration, frequency_hz, amplitude, randomize, ramp_seconds)
 
+    # (2) 文字を波形にする
     waveform = char_to_waveform(
         char,
         dot_duration=params["dot_duration"],
@@ -319,9 +369,11 @@ def generate_morse_wav(
         ramp_seconds=params["ramp_seconds"],
     )
 
+    # (3) 必要ならホワイトノイズを足す(ESC-50の環境音は別モジュール add_esc50_noise.py で後から混ぜる)
     if noise_type == "white":
         waveform = add_white_noise(waveform, snr_db, rng)
 
+    # (4) WAVファイルに書ける範囲(-1.0〜+1.0)に収める
     # ピークが±1.0を超える場合は一様スケーリングで正規化する。
     # np.clipによる波形の切り詰めは高調波歪みを生み、狙ったSNRを崩してしまうため、
     # 信号とノイズを同じ係数で縮小してSNR比を保ったまま±1.0以内に収める。
@@ -330,10 +382,13 @@ def generate_morse_wav(
         waveform = waveform / peak
     waveform = waveform.astype(np.float32)
 
+    # (5) 16bit PCM のWAVとして保存する(保存先フォルダが無ければ作る)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(output_path, waveform, sample_rate, subtype="PCM_16")
 
+    # (6) 生成条件を記録用の辞書にまとめて返す。generate_dataset.py がこれを metadata.csv に書き、
+    #     後から「SNR別の正解率」などを集計するのに使う。パスの区切りは / に統一する。
     metadata = {
         "filepath": str(output_path).replace("\\", "/"),
         "label": char,

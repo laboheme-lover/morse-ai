@@ -28,6 +28,8 @@ DEFAULT_MODELS_DIR = Path("models")
 DEFAULT_TOP_K = 3
 
 
+# 推論結果を入れる小さなデータの入れ物(dataclass)。
+# Candidate = 候補1つ(文字と確信度)、PredictionResult = 1文字分の推論結果一式。
 @dataclass
 class Candidate:
     label: str
@@ -45,17 +47,23 @@ class PredictionResult:
 def load_model(models_dir: str | Path, device: str) -> tuple[MorseCNN, dict, dict, int]:
     """models/best_model.pt と label_mapping.json を読み込む。"""
     models_dir = Path(models_dir)
+    # (1) 学習時に保存した「文字⇔番号の対応」と「入力の長さ(fixed_frames)」を読む。
+    #     推論でもこれと同じ条件を使わないと、番号と文字がずれたり入力の形が変わったりする。
     with open(models_dir / "label_mapping.json", encoding="utf-8") as f:
         mapping = json.load(f)
     label_to_index: dict[str, int] = mapping["label_to_index"]
     fixed_frames: int = mapping["fixed_frames"]
-    index_to_label = {i: label for label, i in label_to_index.items()}
+    index_to_label = {i: label for label, i in label_to_index.items()}  # 番号→文字の逆引き
 
+    # (2) 学習済みの重みを読む。map_location=device でCPU/GPUどちらでも読めるようにする。
+    #     weights_only=True は、重み以外の任意のPythonオブジェクトを読み込まない安全な読み方。
     checkpoint = torch.load(models_dir / "best_model.pt", map_location=device, weights_only=True)
+    # (3) 保存されていた構成(CNNかCRNNか、層の大きさ)で同じ形のモデルを作り、重みを流し込む。
+    #     model_config が無い古いファイルは、クラス数だけ指定した既定のCNNとして作る。
     model_config = checkpoint.get("model_config", {"num_classes": checkpoint["num_classes"]})
     model = model_from_config(model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    model.eval()  # 推論モード(Dropout無効)
     return model, label_to_index, index_to_label, fixed_frames
 
 
@@ -74,14 +82,18 @@ def predict_waveform(
     ファイルに書き出さず直接推論する際に使う。学習(MorseCharacterDataset)と
     同一のwaveform_to_mel/fix_length関数を使うことで前処理を確実に共有する。
     """
+    # (1) 学習時と同じ関数で「音の絵」にし、同じ横幅にそろえる
     mel = waveform_to_mel(y, sample_rate)
     mel_fixed = fix_length(mel, fixed_frames)
+    # unsqueeze を2回: チャンネルの次元(1枚)とバッチの次元(1件)を足す
     x = torch.from_numpy(mel_fixed).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, n_mels, fixed_frames]
 
+    # (2) モデルに通して63文字のスコアを得て、softmax で確率に変換する
     with torch.no_grad():
         logits = model(x)
-        probs = torch.softmax(logits, dim=1).squeeze(0)
+        probs = torch.softmax(logits, dim=1).squeeze(0)  # [63] バッチの次元を取り除く
 
+    # (3) 確率の高い順に上位 k 個を候補として取り出す(1位 = 予測した文字)
     k = min(top_k, probs.shape[0])
     top_probs, top_indices = torch.topk(probs, k)
     candidates = [
@@ -106,6 +118,7 @@ def predict(
     top_k: int = DEFAULT_TOP_K,
 ) -> PredictionResult:
     """1つのWAVファイルから文字を推論する。"""
+    # 16kHz・モノラルに変換しながら読み込む(元のファイルが44.1kHzやステレオでもよい)
     y, sr = librosa.load(str(wav_path), sr=SAMPLE_RATE, mono=True)
     return predict_waveform(y, model, index_to_label, fixed_frames, sr, device, top_k)
 

@@ -22,6 +22,8 @@ matplotlib.use("Agg")  # Windowsのヘッドレス実行でも保存できるよ
 import matplotlib.pyplot as plt
 import numpy as np
 
+# 確認用の補助ツール(学習・推論の処理には使われない)。生成した音声が意図どおりか目で確かめるためのもの。
+# 値は morse_dataset.py の前処理と同じにしてあり、モデルが見るのとほぼ同じ「音の絵」を描く。
 SAMPLE_RATE = 16000
 N_MELS = 64
 N_FFT = 512
@@ -64,9 +66,10 @@ def plot_waveform_and_spectrogram(
     y = load_audio(wav_path, sample_rate)
     mel_db = compute_mel_spectrogram(y, sample_rate)
 
+    # 縦に2段の図を作る: 上 = 波形(時間と振幅)、下 = メルスペクトログラム(時間と周波数)
     fig, axes = plt.subplots(2, 1, figsize=(10, 6))
 
-    times = np.arange(len(y)) / sample_rate
+    times = np.arange(len(y)) / sample_rate  # 各サンプルの時刻[秒]
     axes[0].plot(times, y, linewidth=0.8)
     axes[0].set_title(f"波形: {wav_path.name}")
     axes[0].set_xlabel("時間 [秒]")
@@ -85,6 +88,7 @@ def plot_waveform_and_spectrogram(
 
     fig.tight_layout()
 
+    # 保存先の指定が無ければ、WAVと同じ場所・同じ名前で拡張子だけ .png にする
     if output_path is None:
         output_path = wav_path.with_suffix(".png")
     output_path = Path(output_path)

@@ -36,33 +36,37 @@ DEFAULT_MODELS_DIR = Path("models")
 
 
 def evaluate(model: nn.Module, loader, criterion: nn.Module, device: str) -> tuple[float, float]:
-    model.eval()
+    # 検証データで「損失(外れ具合)」と「正解率」を測る。パラメータは更新しない。
+    model.eval()  # 評価モード: Dropoutを無効にし、BatchNormは学習中に覚えた平均・分散を使う
     total_loss = 0.0
     correct = 0
     total = 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits, y)
-            total_loss += loss.item() * x.size(0)
+    with torch.no_grad():  # 勾配(パラメータの直し方)の計算を省いて速く・省メモリにする
+        for x, y in loader:  # x: 入力 [32, 1, 64, T]、y: 正解のクラス番号 [32]
+            x, y = x.to(device), y.to(device)  # GPUがあればGPUへ送る
+            logits = model(x)  # 各文字のスコア [32, 63]
+            loss = criterion(logits, y)  # このバッチの平均損失
+            total_loss += loss.item() * x.size(0)  # 平均×件数 = 合計に直して足し込む
+            # 一番スコアの高いクラス(argmax)が正解と一致した件数を数える
             correct += (logits.argmax(dim=1) == y).sum().item()
             total += x.size(0)
     return total_loss / total, correct / total
 
 
 def train_one_epoch(model: nn.Module, loader, criterion: nn.Module, optimizer, device: str) -> tuple[float, float]:
-    model.train()
+    # 学習データを1周(1エポック)して、パラメータを少しずつ直す。
+    model.train()  # 学習モード: Dropoutを有効にし、BatchNormはバッチごとの平均・分散を使う
     total_loss = 0.0
     correct = 0
     total = 0
-    for x, y in loader:
+    for x, y in loader:  # 32件ずつ(13,230件 ÷ 32 ≒ 414回)
         x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        logits = model(x)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
+        # --- 学習の1ステップ(機械学習の基本形) ---
+        optimizer.zero_grad()  # (1) 前回のステップで計算した勾配を0に戻す
+        logits = model(x)  # (2) 予想させる
+        loss = criterion(logits, y)  # (3) 正解とのずれ(損失)を計算する
+        loss.backward()  # (4) 誤差逆伝播: 各パラメータを「どちらへ動かせば損失が減るか」(勾配)を計算する
+        optimizer.step()  # (5) 勾配に従って約59万個のパラメータを少しずつ動かす
 
         total_loss += loss.item() * x.size(0)
         correct += (logits.argmax(dim=1) == y).sum().item()
@@ -93,7 +97,8 @@ def train(
     戻り値は best_model_path / label_mapping_path / history_path / best_val_acc を
     含むdict(テストや呼び出し元スクリプトから結果を参照しやすくするため)。
     """
-    torch.manual_seed(seed)
+    torch.manual_seed(seed)  # パラメータの初期値などの乱数を固定し、学習を再現できるようにする
+    # GPU(CUDA)が使えればGPU、無ければCPUで学習する。コードを変えずにGPU搭載PCへ移行できる。
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     models_dir = Path(models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +117,10 @@ def train(
     resume_model_config: dict | None = None
     start_epoch = 0
 
+    # ----- 学習の再開(--resume)の準備 -----
+    # 停電などで止まった学習を続きから始めるため、前回保存した
+    # 文字と番号の対応・入力の長さ・モデルの重み・最適化手法の状態・学習履歴を読み戻す。
+    # 文字と番号の対応や入力の長さが前回と変わると、続きの学習が成り立たないので必ず引き継ぐ。
     if resume:
         if not label_map_path.exists():
             raise FileNotFoundError(f"再開に必要なlabel_mapping.jsonが見つかりません: {label_map_path}")
@@ -145,6 +154,8 @@ def train(
             f"(読み込んだチェックポイント: {checkpoint_path.name}, これまでの最良val_acc={best_val_acc:.4f})"
         )
 
+    # ----- データの準備 -----
+    # train/validation/test の DataLoader を作る。test は学習中には使わない(最終評価専用)。
     train_loader, val_loader, _test_loader, label_to_index, fixed_frames = build_dataloaders(
         metadata_csv,
         batch_size=batch_size,
@@ -153,18 +164,25 @@ def train(
         label_to_index=label_to_index,
     )
 
+    # ----- モデルの準備 -----
+    # 再開時は保存されていた構成で、新規なら --arch(cnn / crnn)で、クラス数63のモデルを作る
     if resume_model_config is not None:
         model = model_from_config(resume_model_config).to(device)
     else:
         model = create_model(arch, len(label_to_index)).to(device)
     if resume_model_state is not None:
-        model.load_state_dict(resume_model_state)
+        model.load_state_dict(resume_model_state)  # 学習済みの重みを書き戻す
 
+    # 損失関数: 交差エントロピー。正解の文字に付けた確率が低いほど大きな値になる。
     criterion = nn.CrossEntropyLoss()
+    # 最適化手法: Adam(パラメータごとに歩幅を自動調整する方式)。
+    # lr=学習率(1回に動かす大きさ)、weight_decay=重みを小さめに保つ力(過学習の抑制)
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if resume_optimizer_state is not None:
         optimizer.load_state_dict(resume_optimizer_state)
 
+    # ----- 学習ループ -----
+    # 1エポック = 学習データ全体を1周すること。エポック番号は再開時も通し番号で数える。
     total_epochs = start_epoch + epochs
     for epoch in range(start_epoch + 1, total_epochs + 1):
         t0 = time.time()
@@ -204,6 +222,10 @@ def train(
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
 
+        # 検証正解率がこれまでで最高なら、そのモデルを best_model.pt として保存する。
+        # 最後のエポックが最良とは限らない(学習しすぎると検証の成績が下がる=過学習)ため、
+        # 学習データではなく「学習に使っていない検証データ」の成績でモデルを選ぶ。
+        # 現行モデルは60エポック中47エポック目が最良だった。
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(

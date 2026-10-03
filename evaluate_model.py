@@ -63,6 +63,7 @@ def run_inference(
     batch_size: int = 32,
 ) -> pd.DataFrame:
     """datasetの全サンプルを推論し、metadataに予測結果・確信度・正誤を結合して返す。"""
+    # shuffle=False: 結果をmetadataの行と同じ順に並べて後で結合するため、順番を変えない
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     predicted_labels: list[str] = []
@@ -70,12 +71,16 @@ def run_inference(
     with torch.no_grad():
         for x, _y in loader:
             x = x.to(device)
-            logits = model(x)
+            logits = model(x)  # 63文字のスコア
+            # softmax: スコアを「合計1の確率」に変換する。一番大きい確率 = 確信度
             probs = torch.softmax(logits, dim=1)
-            conf, pred_idx = probs.max(dim=1)
+            conf, pred_idx = probs.max(dim=1)  # (確信度, 予測したクラス番号)
+            # クラス番号を文字に戻して記録する
             predicted_labels.extend(index_to_label[int(i)] for i in pred_idx.cpu().tolist())
             confidences.extend(conf.cpu().tolist())
 
+    # metadata(ファイル名・正解・速度・ノイズ種別・SNR等)の表に、予測結果の列を付け足す。
+    # これで「SNR別」「ノイズ種別」などの切り口で正解率を集計できる。
     result = dataset.df.copy().reset_index(drop=True)
     result["predicted_label"] = predicted_labels
     result["confidence"] = confidences
@@ -84,7 +89,10 @@ def run_inference(
 
 
 def compute_overall_metrics(df: pd.DataFrame) -> dict:
+    # 正解率(Accuracy): 全件のうち予測が当たった割合
     accuracy = float(df["correct"].mean())
+    # Macro F1: 文字ごとにF1(適合率と再現率の調和平均)を求め、63文字で単純平均したもの。
+    # 件数の多い文字に引っ張られず、「苦手な文字が無いか」を見られる。
     macro_f1 = float(f1_score(df["label"], df["predicted_label"], average="macro", zero_division=0))
     return {"accuracy": accuracy, "macro_f1": macro_f1, "n_samples": int(len(df))}
 
@@ -92,6 +100,7 @@ def compute_overall_metrics(df: pd.DataFrame) -> dict:
 def compute_snr_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """SNR別(cleanも1カテゴリとして含む)のAccuracy・Macro F1を算出する。"""
     df = df.copy()
+    # ノイズなしの行は snr_db が空欄なので "clean" という独立したグループにまとめる
     df["snr_group"] = df.apply(lambda r: "clean" if r["noise_type"] == "clean" else r["snr_db"], axis=1)
 
     rows = []
@@ -123,7 +132,9 @@ def compute_noise_type_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_common_errors(df: pd.DataFrame, top_n: int | None = None) -> pd.DataFrame:
     """誤認識ペア(正解ラベル, 予測ラベル)を出現頻度順に並べる。"""
-    errors = df[~df["correct"]]
+    # 外れた行だけを取り出し、(正解, 予測) の組ごとに件数を数えて多い順に並べる。
+    # 例「ル → シ が12件」のように、どの文字をどの文字と取り違えやすいかが分かる。
+    errors = df[~df["correct"]]  # ~ は「否定」(correct が False の行)
     counts = (
         errors.groupby(["label", "predicted_label"])
         .size()
@@ -138,6 +149,8 @@ def compute_common_errors(df: pd.DataFrame, top_n: int | None = None) -> pd.Data
 
 
 def plot_confusion_matrix(df: pd.DataFrame, labels: list[str], output_path: str | Path) -> Path:
+    # 混同行列: 縦=正解の文字、横=予測した文字、マスの値=件数の63×63の表。
+    # 対角線上(正解=予測)が明るく、それ以外が暗いほど良い。
     cm = confusion_matrix(df["label"], df["predicted_label"], labels=labels)
     fig, ax = plt.subplots(figsize=(16, 14))
     im = ax.imshow(cm, cmap="viridis")
@@ -194,13 +207,18 @@ def evaluate(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # (1) 学習済みモデルと、学習時の「文字と番号の対応」「入力の長さ」を読み込む
     model, label_to_index, index_to_label, fixed_frames = load_model(models_dir, device)
+    # (2) テストデータ(学習にも、モデル選びにも使っていない2,835件)を、学習時と同じ条件で用意する
     dataset = MorseCharacterDataset(
         metadata_csv, split="test", fixed_frames=fixed_frames, label_to_index=label_to_index
     )
 
+    # (3) 全件を推論し、1件ごとの結果をCSVに保存する
     predictions_df = run_inference(model, dataset, index_to_label, device, batch_size)
     predictions_df.to_csv(output_dir / "test_predictions.csv", index=False, encoding="utf-8")
+
+    # (4) いろいろな切り口で集計し、CSVと図に保存する
 
     overall = compute_overall_metrics(predictions_df)
 
