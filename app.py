@@ -35,7 +35,20 @@ from predict_sequence import (
     predict_sequence_from_waveform,
 )
 
-matplotlib.use("Agg")
+# ============================================================================
+# このアプリの仕組み(Streamlit)
+#   Streamlit は「Pythonスクリプトを上から下まで実行すると画面ができる」ライブラリ。
+#   ユーザーがボタンやスライダーを操作するたびに、このスクリプト全体が最初から再実行される。
+#   そのため、重い処理(モデルの読み込み・認識)は結果をキャッシュして、同じ条件なら再計算しない。
+#
+# ファイルの構成
+#   前半「処理」: 音声の読み込み・認識・集計。画面に依存しないので単体テストできる(test_app.py)
+#   中盤「キャッシュ」: モデルと認識結果を使い回すための関数
+#   後半「画面」: main() で画面を組み立てる
+# ============================================================================
+
+matplotlib.use("Agg")  # 画面を持たない描画方式(図はPNGとしてブラウザに送る)
+# グラフの日本語が文字化けしないよう、Windowsにある日本語フォントを順に探して使う
 for _font_name in ("Yu Gothic", "Meiryo", "MS Gothic"):
     if _font_name in {f.name for f in matplotlib.font_manager.fontManager.ttflist}:
         plt.rcParams["font.family"] = _font_name
@@ -63,12 +76,15 @@ def load_audio_bytes(audio_bytes: bytes, suffix: str, sample_rate: int = SAMPLE_
 
     mp3等のデコードにはファイルパスが必要なため、一時ファイルに書き出してから読み込む。
     """
+    # 拡張子付きの一時ファイルを作る(拡張子で mp3 か wav かを判定して読み込むため)
     fd, tmp_name = tempfile.mkstemp(suffix=suffix if suffix.startswith(".") else f".{suffix}")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(audio_bytes)
+        # 16kHz・モノラルに変換して読み込む(学習データと同じ形式にそろえる)
         y, sr = librosa.load(tmp_name, sr=sample_rate, mono=True)
     finally:
+        # 読み込みに失敗しても一時ファイルは必ず消す
         Path(tmp_name).unlink(missing_ok=True)
     return y, sr
 
@@ -80,7 +96,10 @@ def resolve_min_char_gap(
 ) -> float:
     """文字境界とみなす無音の最小長を決める。自動推定時は測定した短点長の倍数とする。"""
     if not auto_estimate:
-        return manual_gap_seconds
+        return manual_gap_seconds  # 手動: スライダーの値をそのまま使う
+    # 自動: 短点の長さ × 1.8。符号内の間隔(1単位)より長く、文字の区切り(3単位以上)より短い値になる。
+    # 例 短点65msの速い音源 → 117ms(固定の0.25秒では区切りを見落とし、164文字が3文字になった)。
+    # ただし0.08秒は下回らないようにする(短点の推定が極端に小さくなった場合の安全策)。
     return max(AUTO_GAP_FLOOR_SECONDS, analysis.dot_duration_seconds * AUTO_GAP_MULTIPLIER)
 
 
@@ -108,9 +127,16 @@ def recognize(
     device: str = "cpu",
 ) -> RecognitionResult:
     """波形を認識する(音響特性の測定→任意の前処理→しきい値決定→分割・推論)。"""
-    analysis = analyze_audio(y, sr)
+    # (1) 前処理ONなら、トーン周波数付近だけを通すフィルタと音量の正規化をかけた音声を認識に使う
     model_input = preprocess_for_inference(y, sr)[0] if preprocess else y
+    # (2) 実際に区間分割にかける音声(前処理ONなら前処理後)から、トーン周波数・短点の長さなどを測る
+    #     (画面の「音響特性の測定結果」にも表示)。前処理前の音声で測ると、雑音が無音部分にも乗った音声では
+    #     無音を検出できず、短点の長さが「音声全体の長さ」と推定されて全体が1文字になってしまう
+    #     (加工音源 no041_fast_white_snrp10 で確認。評価スクリプトは以前から前処理後の音声で測っていた)。
+    analysis = analyze_audio(model_input, sr)
+    # (3) 文字の区切りとみなす無音の長さを決める(自動推定 or 手動)
     gap = resolve_min_char_gap(analysis, min_char_gap_seconds, auto_gap)
+    # (4) 区間分割 → 1文字ずつ推論
     sequence = predict_sequence_from_waveform(
         model_input, sr, model, index_to_label, fixed_frames, top_k=top_k, min_char_gap_seconds=gap, device=device
     )
@@ -155,8 +181,10 @@ def render_text_html(units: list[DisplayUnit]) -> str:
     """認識結果を、要確認の文字を強調したHTMLにする(暗色テーマでも読める半透明の背景色)。"""
     parts = []
     for unit in units:
+        # html.escape: 「<」などの記号がHTMLタグとして解釈されないよう無害な表記に変える
         text = html.escape(unit.text)
         if unit.needs_review:
+            # 確信度の低い文字は橙色の背景と下線で強調し、マウスを乗せると確信度を表示する
             parts.append(
                 f'<span style="background:rgba(255,170,0,0.35);border-bottom:3px solid #e67e00;'
                 f'border-radius:3px;padding:0 1px;" title="確信度 {unit.confidence:.2f}">{text}</span>'
@@ -184,6 +212,9 @@ def plot_mel(mel_db: np.ndarray, title: str):
 # --- キャッシュ ------------------------------------------------------------
 
 
+# cache_resource: モデルのような「使い回す重いもの」を1回だけ作って保持する。
+# 引数が同じなら2回目以降は読み込まない。model_mtime(モデルファイルの更新日時)を引数に含めているので、
+# 再学習で best_model.pt が更新されると自動で読み込み直される。
 @st.cache_resource(show_spinner="モデルを読み込み中...")
 def get_model_bundle(models_dir: str, model_mtime: float):
     """モデルはプロセス内で1回だけ読み込む(model_mtimeは再学習時にキャッシュを無効にするため)。"""
@@ -192,6 +223,8 @@ def get_model_bundle(models_dir: str, model_mtime: float):
     return model, index_to_label, fixed_frames, device
 
 
+# cache_data: 計算結果をキャッシュする。音声の中身と設定がすべて同じなら、認識をやり直さず前回の結果を返す。
+# (画面の「文字を選ぶ」操作などでスクリプトが再実行されても、認識が毎回走らないようにするため)
 @st.cache_data(show_spinner="認識中...(長い音声では数十秒かかることがあります)")
 def run_recognition(
     audio_bytes: bytes,
@@ -218,6 +251,7 @@ def main() -> None:
     st.title("📻 和文モールス信号AI翻訳")
     st.caption("音声ファイルをアップロードすると、文字ごとに分割してCNNで認識し、日本語文字列として表示します。")
 
+    # ----- 学習済みモデルの確認 -----
     models_dir = str(APP_DIR / DEFAULT_MODELS_DIR)
     best_model_path = Path(models_dir) / "best_model.pt"
     if not best_model_path.exists():
@@ -225,6 +259,8 @@ def main() -> None:
         return
     model_mtime = best_model_path.stat().st_mtime
 
+    # ----- 左側(サイドバー): 認識設定 -----
+    # 各ウィジェットは「現在の値」を返す。値が変わるとスクリプト全体が再実行され、新しい値で認識し直す。
     with st.sidebar:
         st.header("認識設定")
         auto_gap = st.checkbox(
@@ -259,12 +295,13 @@ def main() -> None:
             "ほぼ差はない)。",
         )
 
+    # ----- 音声ファイルのアップロード -----
     uploaded = st.file_uploader(
         "モールス信号の音声ファイルを選択(WAV / MP3)", type=SUPPORTED_AUDIO_TYPES, accept_multiple_files=False
     )
     if uploaded is None:
         st.info("音声ファイルをアップロードしてください。")
-        return
+        return  # ファイルが無ければここで画面の組み立てを終える
 
     audio_bytes = uploaded.getvalue()
     suffix = Path(uploaded.name).suffix.lower() or ".wav"
@@ -272,6 +309,7 @@ def main() -> None:
     st.subheader("アップロード音声")
     st.audio(audio_bytes)
 
+    # ----- 認識の実行(結果はキャッシュされる) -----
     try:
         result = run_recognition(
             audio_bytes, suffix, float(min_gap), bool(auto_gap), int(top_k), bool(preprocess), models_dir, model_mtime
@@ -280,11 +318,14 @@ def main() -> None:
         st.error(f"音声の読み込みまたは認識に失敗しました: {exc}")
         return
 
+    # 濁音を1文字に結合し、確信度がしきい値未満の文字に「要確認」の印を付ける。
+    # 低確信度しきい値の変更は認識のやり直しを伴わない(キャッシュ済みの結果から作り直すだけ)。
     units = build_display_units(result.sequence, low_conf)
     if not units:
         st.warning("音の区間が検出できませんでした。無音のファイル、または文字間隔しきい値が合っていない可能性があります。")
         return
 
+    # ----- 右側: 認識結果・概要・測定結果 -----
     st.subheader("認識結果")
     st.markdown(render_text_html(units), unsafe_allow_html=True)
     if any(u.needs_review for u in units):
@@ -305,6 +346,7 @@ def main() -> None:
         m3.metric("文字間の無音(目安)", f"{a.char_gap_seconds * 1000:.0f} ms")
         m4.metric("概算打鍵速度", f"{a.wpm:.0f} WPM")
 
+    # ----- 文字ごとの詳細の表 -----
     st.subheader("文字ごとの詳細")
     table = build_details_table(result.sequence, units)
     only_review = st.checkbox("要確認の文字のみ表示", value=False)
@@ -329,11 +371,15 @@ def main() -> None:
         format_func=lambda n: f"{n}: {units[n - 1].text}(確信度 {units[n - 1].confidence:.2f})"
         + ("  要確認" if units[n - 1].needs_review else ""),
     )
+    # ----- 選んだ文字の詳細: その部分の音声・メルスペクトログラム・候補 -----
     unit = units[selected_number - 1]
+    # 濁音(ガ等)は「カ」と「゛」の2区間からなるので、その両方を取り出す
     segments = [result.sequence.characters[i] for i in unit.segment_indices]
     start_sample, end_sample = segments[0].start_sample, segments[-1].end_sample
+    # 元の(前処理前の)音声から、その文字の部分だけを切り出して再生できるようにする
     st.audio(result.waveform[start_sample:end_sample], sample_rate=result.sample_rate)
 
+    # 区間ごとに1列ずつ並べて、モデルが見た「音の絵」と候補を表示する
     columns = st.columns(len(segments))
     for column, segment in zip(columns, segments):
         with column:
@@ -350,6 +396,7 @@ def main() -> None:
             )
             plt.close("all")
 
+    # どのファイルの結果かを後から確かめられるよう、ファイル名と中身のハッシュ値(先頭8桁)を表示する
     audio_hash = hashlib.md5(audio_bytes).hexdigest()[:8]
     st.caption(f"ファイル: {uploaded.name}(md5先頭8桁: {audio_hash})")
 
