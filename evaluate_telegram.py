@@ -14,6 +14,21 @@
 from __future__ import annotations
 
 import argparse
+# ============================================================================
+# このスクリプトの流れ
+#   (1) find_jobs: 評価する (WAV, 正解テキスト) の組を集める
+#   (2) run: 複数のプロセスで並列に _evaluate_job を実行し、1件終わるごとにCSVへ追記する
+#       _evaluate_job = 認識(app.recognize)→ 音から符号を読む → 後処理 → 採点(score_row)
+#   (3) summarize: パターン(原音・加工の種類)ごとに平均して表示する
+#   後処理だけを直したときは --rescore で、CSVに保存した区間の列(tokens)に後処理をかけ直す。
+#   認識(数十分〜数時間)をやり直さずに、後処理の変更の効果を数秒で確かめられる。
+#
+# CSVの列の読み方
+#   raw_*  = 後処理なし(モデルの出力そのまま)、post_* = 後処理あり
+#   *_all / *_header / *_address / *_body = 全体 / 前文 / 名あて / 本文
+#   *_match = 文字一致率、*_insert = 挿入率(余分な文字の数 / 正解の文字数)
+#   old_char_match_rate = 従来の採点(「」」と括弧を正解から除く)での後処理なしの文字一致率
+# ============================================================================
 import csv
 import os
 import re
@@ -24,6 +39,7 @@ from pathlib import Path
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
+# 部分の名前(telegram_scoring と同じ)と、CSVの列名に使う英字の名前の対応
 SECTIONS = ("前文", "名あて", "本文")
 SECTION_KEYS = {"前文": "header", "名あて": "address", "本文": "body", "全体": "all"}
 
@@ -36,6 +52,9 @@ DETAIL_FIELDS = (
 )
 
 
+# <root>/<フォルダ>/*.wav のうち、同じ名前の .txt があるものを集める。
+# ファイル名が audio2 の形(no001_fast_white_snrp10 など)なら加工条件を読み取り、
+# それ以外(合成データ tg001_original など)は原音として扱う。
 def find_jobs(root: Path, which: str, folder_regex: str | None) -> list[dict]:
     from evaluate_audio_variants import parse_variant
 
@@ -55,9 +74,11 @@ def find_jobs(root: Path, which: str, folder_regex: str | None) -> list[dict]:
     return jobs
 
 
+# 並列処理の各ワーカー(プロセス)で1回だけ読み込むモデル
 _MODEL = None
 
 
+# 各ワーカーのPyTorchは1スレッドに制限する(ワーカー数×スレッド数でCPUを取り合わないように)
 def _init_worker(models_dir: str) -> None:
     os.environ["OMP_NUM_THREADS"] = "1"
     import torch
@@ -76,6 +97,7 @@ def score_row(predicted_raw: str, reading, ground_truth_raw: str) -> dict:
     from evaluate_real_samples import compare_texts
     from telegram_scoring import compare_by_section, split_telegram_ground_truth
 
+    # 新しい採点の正解(前文・名あて・本文に分け、「」」→「。」、括弧は残す)と、比較用に従来の採点の正解
     gt = split_telegram_ground_truth(ground_truth_raw)
     old_gt, _ = prepare_ground_truth(ground_truth_raw)
     row = {
@@ -89,6 +111,8 @@ def score_row(predicted_raw: str, reading, ground_truth_raw: str) -> dict:
         "predicted_post": reading.text,
         "ground_truth": gt.text,
     }
+    # 後処理なし・ありの両方を、同じ正解・同じ方法で部分ごとに採点する。
+    # 正解の無い部分(本文だけのテキストの前文など)は空欄のままにする
     for stage, text in (("raw", predicted_raw), ("post", reading.text)):
         result = compare_by_section(text, gt.sections)
         for name, key in SECTION_KEYS.items():
@@ -100,6 +124,7 @@ def score_row(predicted_raw: str, reading, ground_truth_raw: str) -> dict:
     return row
 
 
+# 例: 「、,.-.-.-,0.21;1,.----,0.2;…」(音の符号が読めなかった区間は符号が空、最後の区間は無音が空)
 def encode_tokens(tokens) -> str:
     """区間の列を「文字,符号,無音[秒]」の並び(; 区切り)にして保存する。後処理だけをやり直すときに使う。"""
     return ";".join(f"{t.text},{t.pattern or ''},{'' if t.pause_after is None else round(t.pause_after, 3)}" for t in tokens)
@@ -121,13 +146,16 @@ def rescore(details_csv: Path, roots: list[Path]) -> None:
 
     from telegram_format import interpret_telegram
 
+    # すべて文字列として読み、書き戻すときに数値の表記(0.9800 → 0.98 など)が変わらないようにする
     df = pd.read_csv(details_csv, encoding="utf-8", keep_default_na=False, dtype=str)
+    # ファイル名 → 正解テキストのパス(CSVには正解テキストの元の形が残っていないので、読み直す)
     txt_by_file = {wav.name: wav.with_suffix(".txt") for root in roots for wav in root.glob("*/*.wav")}
     rows = []
     for row in df.to_dict("records"):
         if not row["error"]:
             reading = interpret_telegram(decode_tokens(row["tokens"]), mode="auto")
             raw_text = txt_by_file[row["file"]].read_text(encoding="utf-8-sig")
+            # 前回の後処理ありの値を消してから付け直す(今回空欄になる部分に古い値が残らないように)
             row.update({k: "" for k in DETAIL_FIELDS if k.startswith("post_")})
             row.update(score_row(row["predicted_raw"], reading, raw_text))
         rows.append(row)
@@ -153,12 +181,15 @@ def _evaluate_job(job: dict) -> dict:
     try:
         model, index_to_label, fixed_frames = _MODEL
         y, sr = librosa.load(job["wav"], sr=SAMPLE_RATE, mono=True)
+        # アプリと同じ設定で認識する(文字間隔の自動推定ON・前処理ON。手動のしきい値は自動推定ONなら使われない)
         result = recognize(
             y, sr, model, index_to_label, fixed_frames,
             min_char_gap_seconds=DEFAULT_MIN_CHAR_GAP_SECONDS, auto_gap=True, top_k=3, preprocess=True,
         )
         dot = result.analysis.dot_duration_seconds
         ranges = [(c.start_sample, c.end_sample) for c in result.sequence.characters]
+        # 区間ごとに音から短点・長点の並びを読み、区間の列(tokens)にして後処理にかける(アプリの read_telegram と同じ手順。
+        # 評価では区間の列をCSVに保存するため、ここでは手順を分けて書いている)
         patterns = read_element_patterns(result.model_input, sr, ranges, dot) if ranges else []
         tokens = tokens_from_sequence(result.sequence, sr, patterns)
         reading = interpret_telegram(tokens, mode="auto")
@@ -176,6 +207,7 @@ def run(root: Path, which: str, details_csv: Path, models_dir: str, workers: int
     from multiprocessing import Pool
 
     jobs = find_jobs(root, which, folder_regex)
+    # 再開: 既にCSVにある(エラーでない)ファイルは飛ばす
     done = set()
     if details_csv.exists():
         with open(details_csv, encoding="utf-8", newline="") as f:
@@ -192,6 +224,7 @@ def run(root: Path, which: str, details_csv: Path, models_dir: str, workers: int
         if new_file:
             writer.writeheader()
         with Pool(processes=min(workers, len(todo)), initializer=_init_worker, initargs=(models_dir,)) as pool:
+            # 長い音声から先に処理すると、最後に長いものが1つだけ残って待たされることを避けられる
             todo.sort(key=lambda j: os.path.getsize(j["wav"]), reverse=True)
             for n, row in enumerate(pool.imap_unordered(_evaluate_job, todo), start=1):
                 writer.writerow(row)
@@ -209,6 +242,7 @@ def summarize(details_csv: Path) -> None:
     cols = [c for c in DETAIL_FIELDS if c.startswith(("raw_", "post_")) or c == "old_char_match_rate"]
     for c in cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    # CSVから読むと True/False が文字列になることがあるので、真偽値にそろえる
     df["detected"] = df["detected"].astype(str) == "True"
     rows = []
     for pattern, g in df.groupby("pattern"):

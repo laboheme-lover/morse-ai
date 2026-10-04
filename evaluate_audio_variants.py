@@ -17,6 +17,19 @@
 
 from __future__ import annotations
 
+# ============================================================================
+# このスクリプトの流れ
+#   (1) find_jobs: フォルダの中の WAV と同じ名前の .txt(正解)の組を集め、ファイル名から加工条件を読む
+#   (2) run: 複数のプロセスで並列に _evaluate_job を実行し、1件終わるごとに明細CSVへ追記する
+#       _evaluate_job = 正解の準備(prepare_ground_truth)→ 認識(app.recognize)→ 比較(compare_texts)
+#   (3) summarize: 加工パターン(原音 / 速度×雑音×SN比)ごとに平均・最小などを集計する
+#   明細と集計はExcelの報告書(加工音源テスト結果_*.xlsx)の元データになる。
+#
+# アプリと同じ条件で測る理由
+#   利用者がアプリで同じ音声を読み込んだときと同じ結果になるよう、認識はアプリの recognize() を
+#   そのまま呼ぶ。以前、評価スクリプトとアプリで短点の長さを測る音声(前処理の前か後か)が違っていて、
+#   評価では読めるのにアプリでは1文字になる音源があった(この評価で見つかり、アプリを直した)。
+# ============================================================================
 import argparse
 import csv
 import os
@@ -33,6 +46,8 @@ DEFAULT_DETAILS_CSV = Path("evaluation/audio_variants_details.csv")
 DEFAULT_SUMMARY_CSV = Path("evaluation/audio_variants_summary.csv")
 
 # ファイル名 "no041_fast_white_snrp10" を (番号, 速度, 雑音, SN比) に分解する
+# グループ: (1) 番号、(2) original、(3) 速度、(4) 雑音、(5) SN比の符号(m=マイナス, p=プラス)、(6) SN比の値
+# 例 "no041_slow_esc50_snrm05" → 番号 no041・速度 slow・雑音 esc50・SN比 -5dB
 VARIANT_RE = re.compile(r"^(no\d+)_(?:(original)|(fast|normal|slow)_(clean|white|esc50)(?:_snr([mp])(\d+))?)$")
 
 # 電気通信術受信練習用原信(audio2)の正解テキストは、1行目に送信されない見出し
@@ -43,6 +58,7 @@ SPEED_ORDER = ["fast", "normal", "slow"]
 NOISE_ORDER = ["clean", "white", "esc50"]
 SNR_ORDER = [20, 10, 5, 0, -5]
 
+# 明細CSVの列。文字一致率などの定義は evaluate_real_samples.compare_texts と同じ(どれも正解の文字数が分母)
 DETAIL_FIELDS = [
     "folder",
     "file",
@@ -78,6 +94,7 @@ def parse_variant(stem: str) -> dict | None:
     folder, original, speed, noise, sign, value = m.groups()
     if original:
         return {"folder": folder, "pattern": "original", "speed": "", "noise": "", "snr_db": ""}
+    # SN比はファイル名の「m05」「p10」を -5 / +10 に直す。雑音なし(clean)にはSN比が無い
     snr = ""
     if sign is not None:
         snr = int(value) * (-1 if sign == "m" else 1)
@@ -104,6 +121,7 @@ def prepare_ground_truth(raw_text: str) -> tuple[str, list[str]]:
     from evaluate_real_samples import normalize_ground_truth
     from generate_real_text_synthetic_dataset import KANJI_DIGIT
 
+    # (1) 見出し行を除く (2) 漢数字を数字にする (3) 実録音と同じ正規化をする
     lines = [line for line in raw_text.splitlines() if not TITLE_LINE_RE.search(line)]
     text = "".join(KANJI_DIGIT.get(ch, ch) for ch in "\n".join(lines))
     return normalize_ground_truth(text)
@@ -114,6 +132,7 @@ def find_jobs(root: Path, which: str, folder_regex: str | None = None) -> list[d
 
     folder_regex を指定すると、フォルダ名がその正規表現に一致するものだけを対象にする。
     """
+    # 対象を集める。which で原音だけ・加工音源だけ・両方を選び、folder_regex でフォルダを絞る
     jobs: list[dict] = []
     for wav in sorted(root.glob("*/*.wav")):
         info = parse_variant(wav.stem)
@@ -161,6 +180,7 @@ def _evaluate_job(job: dict) -> dict:
     from morse_table import compose_dakuten
 
     started = time.time()
+    # 1件の処理: 失敗しても全体を止めず、エラーの内容を明細の error 列に残す
     row = {field: "" for field in DETAIL_FIELDS}
     row.update({k: job[k] for k in ("folder", "file", "pattern", "speed", "noise", "snr_db")})
     try:
@@ -174,6 +194,7 @@ def _evaluate_job(job: dict) -> dict:
             y, sr, model, index_to_label, fixed_frames,
             min_char_gap_seconds=DEFAULT_MIN_CHAR_GAP_SECONDS, auto_gap=True, top_k=3, preprocess=True,
         )
+        # 濁音を1文字に結合してから正解と比べる(正解テキストは「ガ」のように書かれている)
         predicted = compose_dakuten(result.sequence.text)
         comparison = compare_texts(predicted, ground_truth)
         row.update(
@@ -247,6 +268,7 @@ def summarize(details_csv: Path, summary_csv: Path) -> None:
     for c in metrics + ["ground_truth_len", "predicted_len"]:
         df[c] = pd.to_numeric(df[c])
     # 一致した文字数(正解の文字数×一致率)。全件まとめた一致率(文字数で重み付け)の計算に使う
+    # 平均は「ファイルごとの一致率の平均」と「全ファイルの文字数で重み付けした一致率」(overall)の両方を出す
     df["matched_chars"] = df["char_match_rate"] * df["ground_truth_len"]
 
     rows = []
@@ -270,6 +292,7 @@ def summarize(details_csv: Path, summary_csv: Path) -> None:
             }
         )
     summary = pd.DataFrame(rows)
+    # 集計表の並び: 原音 → 速度 → 雑音 → SN比の高い順(pattern_sort_key)
     summary["_order"] = [pattern_sort_key(s, n, r) for s, n, r in zip(summary["speed"], summary["noise"], summary["snr_db"])]
     summary = summary.sort_values("_order").drop(columns="_order")
     summary_csv.parent.mkdir(parents=True, exist_ok=True)

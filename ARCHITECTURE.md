@@ -12,8 +12,8 @@
 |---|---|---|---|
 | ① データを作る | 学習用のモールス音声をプログラムで合成する | `generate_morse_audio.py`, `generate_dataset.py` | `data/dataset/`(18,900件)と `metadata.csv` |
 | ② 学習する | 音声を「音の絵」に変換し、モデルに学習させる | `morse_dataset.py`, `morse_cnn.py`, `train.py` | `models/best_model.pt`, `label_mapping.json` |
-| ③ 評価する | テストデータ・実録音・最終確認データで精度を測る | `evaluate_model.py`, `evaluate_real_samples.py`, `evaluate_real_text_synthetic_dataset.py` | `evaluation/*.csv`, `*.png` |
-| ④ 使う | 音声ファイルから文字列を認識し、画面に表示する | `predict.py`, `morse_segmentation.py`, `predict_sequence.py`, `audio_preprocessing.py`, `app.py` | 認識結果(画面表示) |
+| ③ 評価する | テストデータ・実録音・最終確認データ・加工音源・電報形式の音源で精度を測る | `evaluate_model.py`, `evaluate_real_samples.py`, `evaluate_real_text_synthetic_dataset.py`, `evaluate_audio_variants.py`, `evaluate_telegram.py` | `evaluation/*.csv`, `*.png` |
+| ④ 使う | 音声ファイルから文字列を認識し、画面に表示する。電報形式の音声は前文・名あて・本文に分けて読む | `predict.py`, `morse_segmentation.py`, `predict_sequence.py`, `audio_preprocessing.py`, `telegram_format.py`, `app.py` | 認識結果(画面表示) |
 
 全体の土台として、文字と符号の対応を定義する `morse_table.py` がある。
 
@@ -41,9 +41,14 @@
      合成テストデータ2,835件で正解率・F1           morse_segmentation.py ─ 連続音声を1文字ずつに区切る
    evaluate_real_samples.py                       audio_preprocessing.py  周波数・速度の測定、雑音除去
      実録音44件で連続音声認識の文字一致率         predict_sequence.py ─── 区切る→1文字ずつ推論→文字列
-   generate_real_text_synthetic_dataset.py         app.py ─────────────── ブラウザ画面(Streamlit)
-   evaluate_real_text_synthetic_dataset.py
+   generate_real_text_synthetic_dataset.py         telegram_format.py ─── 電報形式の後処理(前文・名あて・本文)
+   evaluate_real_text_synthetic_dataset.py         app.py ─────────────── ブラウザ画面(Streamlit)
      最終確認データ20電文の生成と評価
+   evaluate_audio_variants.py
+     加工音源(速度×雑音×SN比)ごとの文字一致率
+   generate_telegram_synthetic_dataset.py
+   evaluate_telegram.py + telegram_scoring.py
+     電報形式の合成データ・audio2で、後処理の前後を前文・名あて・本文ごとに評価
 ```
 
 ## 3. 音声ファイルを認識するまでの流れ(アプリ実行時)
@@ -53,17 +58,34 @@
 | 順番 | 処理 | 担当(関数) |
 |---|---|---|
 | 1 | ファイルを16kHz・モノラルの波形として読み込む | `app.load_audio_bytes` |
-| 2 | トーン周波数・短点の長さを測る | `audio_preprocessing.analyze_audio` |
-| 3 | トーン周波数±150Hzだけを通すフィルタで雑音を減らし、音量をそろえる(既定ON) | `audio_preprocessing.preprocess_for_inference` |
+| 2 | トーン周波数±150Hzだけを通すフィルタで雑音を減らし、音量をそろえる(既定ON) | `audio_preprocessing.preprocess_for_inference` |
+| 3 | 前処理後の音声で、トーン周波数・短点の長さを測る | `audio_preprocessing.analyze_audio` |
 | 4 | 文字の区切りとみなす無音の長さを決める(短点の長さ×1.8、既定ON) | `app.resolve_min_char_gap` |
 | 5 | 5msごとの音の強さから有音/無音を判定し、長い無音で1文字ずつに区切る | `morse_segmentation.split_into_characters` |
 | 6 | 区切った1文字ごとに「音の絵」にしてモデルで推論する | `predict.predict_waveform` |
-| 7 | 「カ」+「゛」を「ガ」に結合し、確信度の低い文字に印を付ける | `predict_sequence.build_display_units` |
-| 8 | 文字列・確信度・文字ごとの詳細を表示する | `app.main` |
+| 7 | ヘ(短点1つ)/ム(長点1つ)と読んだ区間を、音の長さ(短点の2倍以上ならム)で判定し直す | `predict_sequence.correct_single_element_by_duration` |
+| 8 | 「カ」+「゛」を「ガ」に結合し、確信度の低い文字に印を付ける | `predict_sequence.build_display_units` |
+| 9 | 電報形式なら、前文・名あて・本文に分けて読む(本文だけの音声はそのまま。既定は自動) | `telegram_format.read_telegram` |
+| 10 | 電報として読んだ結果・文字列・確信度・文字ごとの詳細を表示する | `app.main` |
 
 モデル(手順6)は「1文字分の音声」しか扱えない。連続した音声を認識できるのは、
 その前の手順2〜5で音声を1文字ずつに区切っているからである。精度が落ちたときは、
 「区切り方(手順2〜5)」と「1文字の判定(手順6)」のどちらの問題かを分けて考える。
+手順7・9は、モデルが1文字だけを見ていては分からないこと(音声全体の速度、電報の形式)を補う後処理である。
+
+### 電報形式の読み取り(手順9)の中身
+
+無線の電報(和文電報形式)は、本文の前後に前文と決まった信号が付く。符号表に無い信号は、モデルが
+一番近い仮名(本文の始まり -..--- → エ、60字ごと ..--.. → ト、終了 ...-. → チ、括弧 → サ/ン)として出す。
+
+| 順番 | 処理 |
+|---|---|
+| 9-1 | 区間ごとに、音から短点・長点の並びを読み取る(`read_element_patterns`) |
+| 9-2 | 最初の信号の前・最後の信号の後の雑音(ヘ)を除き、開始の信号(HR HR と「、」)と終了の信号を除く |
+| 9-3 | 前文を正規表現で読み、字数・発信局(ハツ+番号 または 局名)・発信番号(タナ)・受付時刻に分ける。受付時刻の略体の数字だけ数字に戻す |
+| 9-4 | 前文の形とほかの信号が見つからなければ、ここでやめて認識結果をそのまま返す(本文だけの音声) |
+| 9-5 | 本文の始まりの信号の前を名あて、後ろを本文とする |
+| 9-6 | 本文から60字ごとの信号(約5秒の無音が続くもの)を除き、対になった括弧を戻す。本文の文字数を前文の字数と比べる |
 
 ## 4. プログラム一覧
 
@@ -135,8 +157,10 @@
 | `generate_real_text_synthetic_dataset` | `generate_dataset`, `generate_morse_audio`, `add_esc50_noise`, `esc50_manager`, `morse_table` |
 | `evaluate_real_text_synthetic_dataset` | `evaluate_real_samples`, `predict_sequence`, `audio_preprocessing`, `morse_table` |
 | `telegram_format` | `morse_segmentation`, `morse_table` |
+| `generate_telegram_synthetic_dataset` | `generate_morse_audio`, `generate_real_text_synthetic_dataset`, `evaluate_real_samples`, `telegram_format`, `morse_table` |
 | `telegram_scoring` | `evaluate_real_samples`, `generate_real_text_synthetic_dataset`, `morse_table` |
 | `app` | `predict_sequence`, `predict`, `audio_preprocessing`, `morse_segmentation`, `morse_dataset`, `telegram_format` |
+| `evaluate_audio_variants` | `app`, `evaluate_real_samples`, `generate_real_text_synthetic_dataset`, `morse_table` |
 | `evaluate_telegram` | `app`, `telegram_format`, `telegram_scoring`, `evaluate_audio_variants`, `evaluate_real_samples` |
 
 学習(`train.py`)と推論(`predict.py`)が同じ `morse_dataset.py` の変換関数を使っているのが
@@ -160,7 +184,7 @@
 
 ## 7. テスト
 
-`test_<プログラム名>.py` が、それぞれのプログラムの自動テストになっている(合計246件)。
+`test_<プログラム名>.py` が、それぞれのプログラムの自動テストになっている(合計250件)。
 `conftest.py` は、ESC-50が無い環境でもテストできるよう、小さな偽のESC-50データを用意する。
 
 ```powershell

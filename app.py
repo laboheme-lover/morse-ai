@@ -189,6 +189,8 @@ def build_details_table(sequence: SequencePrediction, units: list[DisplayUnit]) 
 
 def build_telegram_table(reading: TelegramReading) -> pd.DataFrame:
     """電報形式として読んだ結果を「項目・内容」の表にする(前文の欄・名あて・本文の字数)。"""
+    # 前文の欄(字数・発信局・発信番号・受付時刻)を1行ずつ並べ、そのあとに名あて・本文の字数・見つけた信号を足す。
+    # 本文の字数は前文の字数と見比べられるように出す(合わなければ画面に警告も出る)
     rows = [{"項目": k, "内容": v} for k, v in reading.header_fields.items()]
     rows.append({"項目": "名あて", "内容": reading.address})
     rows.append({"項目": "本文の文字数", "内容": f"{len(reading.body)}字"})
@@ -313,6 +315,7 @@ def main() -> None:
             "ノイズの多い録音では区間分割の精度が大きく改善するため既定でON(ノイズの少ない録音では"
             "ほぼ差はない)。",
         )
+        # 電報形式の解釈: 既定は「自動」。本文だけの音声では何も変わらないので、常に自動のままでよい
         telegram_label = st.radio(
             "電報形式の解釈",
             list(TELEGRAM_MODES),
@@ -354,10 +357,13 @@ def main() -> None:
         return
 
     # ----- 電報形式の解釈(前文・名あて・本文に分ける。認識はやり直さない) -----
+    # 認識結果(キャッシュ済み)から読み直すだけなので、設定を切り替えても認識はやり直さない。
+    # 音から符号を読むのは認識に使った波形(前処理後)。古いキャッシュで model_input が無ければ元の波形を使う
     reading = read_telegram(
         result.sequence, result.model_input if result.model_input is not None else result.waveform,
         result.sample_rate, result.analysis.dot_duration_seconds, TELEGRAM_MODES[telegram_label],
     )
+    # 電報と判定したときだけ、モデルの出力より上に「電報として読んだ結果」を表示する
     if reading.detected:
         st.subheader("電報として読んだ結果")
         st.markdown(f'<div style="font-size:1.6rem;line-height:2.2rem;word-break:break-all;">'

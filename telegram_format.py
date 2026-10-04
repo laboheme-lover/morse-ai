@@ -21,6 +21,32 @@
 
 from __future__ import annotations
 
+# ============================================================================
+# このモジュールの役割
+#   認識(predict_sequence)が終わったあとに動く「後処理」。モデルや区間分割には手を加えない。
+#   入力は区間ごとの認識結果(モデルの出力文字・区間の位置)と、認識に使った波形。
+#   出力は TelegramReading(前文の各欄・名あて・本文と、見つけた信号・警告)。
+#
+# 処理の流れ(interpret_telegram)
+#   (0) 最初の信号の前・最後の信号の後にある雑音(ヘ)を除く
+#   (1) 先頭の開始の信号(HR HR と「、」)を除く
+#   (2) 末尾の終了の信号(...-. など)を除く
+#   (3) 前文を正規表現で読み、字数・発信局・発信番号・受付時刻に分ける
+#   (4) 本文の始まりの信号を探し、その前を名あて、後ろを本文とする
+#   (5) 本文から60字ごとの信号を除き、括弧を戻す。字数と本文の長さを比べる
+#
+# 「音から読んだ符号」を使う理由
+#   モデルは符号表に無い信号を一番近い仮名として出すので、文字だけを見ると本物の「エ」「ト」「チ」と
+#   区別できない(例: 名あての「アタゴマエ」のエ、本文の「トヨタ」のト)。そこで区間の音から
+#   短点・長点の並びを読み取り、「モデルの文字の符号と違い、かつ信号の符号と一致する」区間だけを
+#   信号とみなす(_is)。雑音で音の読み取りが崩れても、文字としての読み(エ・ト・チ)と
+#   位置・無音の長さを手がかりにした予備の判定を用意している。
+#
+# 本文だけの音声(無線以外の送信)には何もしない
+#   auto(既定)では前文の形が見つからなければ、認識結果をそのまま返す。
+#   実録音 audio の1,496件(本文だけ)では、電報形式と判定されたものは0件だった。
+# ============================================================================
+
 import re
 from dataclasses import dataclass, field
 
@@ -46,9 +72,14 @@ SERIAL_NUMBER_PREFIX = "タナ"  # 発信番号の前に付ける
 # 略体の数字(受付時刻で使う)。1 .- / 2 ..- / 3 ...- / 7 -... / 8 -.. / 9 -. / 0 - は仮名と同じ符号になる。
 # 4・5・6 は通常の数字と同じ符号(audio2の原音でも4・5・6は通常の符号で送られていた)。
 RYAKUTAI_DIGITS = {"イ": "1", "ウ": "2", "ク": "3", "ハ": "7", "ホ": "8", "タ": "9", "ム": "0"}
+# 受付時刻の欄に現れうる文字(略体の数字として読まれる仮名 + 通常の数字)。正規表現の文字クラスにする
 TIME_CHAR_CLASS = "[" + "".join(RYAKUTAI_DIGITS) + "0-9]"
 
 # 前文: 字数 → (ハツ+局番号[+タナ] | 局名) → 発信番号 → コ/セ → 時、分 → 区切りの「、」
+# 例(局を番号で表す): 「142ハツ47タナ78セ5、クタ、」 → 字数142・局47・発信番号78・セ5時39分
+# 例(局名で表す)    : 「133アタミマルチヨウシムセン67コウ、ホ、」 → 字数133・局名・発信番号67・コ2時8分
+# 局名は「数字以外の文字の最短の並び」(\D+?)で、そのあとに発信番号の数字が続くところまでとする。
+# 「^」で先頭に固定しているので、本文の途中に似た並びがあっても前文とはみなさない。
 HEADER_RE = re.compile(
     rf"^(?P<count>\d{{1,4}})"
     rf"(?:{STATION_NUMBER_PREFIX}(?P<station_number>\d{{1,4}})(?:{SERIAL_NUMBER_PREFIX})?|(?P<station_name>\D+?))"
@@ -72,6 +103,7 @@ BRACKET_PAIR_MAX_TOKENS = 30
 # (電報形式と判定できなかったときは、除かずに認識結果をそのまま返す)。
 NOISE_BLIP = "ヘ"
 
+# auto: 判定して電報形式のときだけ適用 / off: 適用しない / on: 判定せず適用(アプリの「電報形式の解釈」)
 MODES = ("auto", "off", "on")
 
 
@@ -85,17 +117,22 @@ def read_element_patterns(
     雑音が強いと有音の判定が崩れるため、読み取った並びは「符号表に無い信号の符号と完全に一致したとき」
     だけ使う(interpret_telegram)。
     """
+    # (1) 音声全体を5msごとの音の強さにし、区間分割と同じヒステリシス判定で「鳴っている区間」を求める。
+    #     1つの「鳴っている区間」が、短点または長点1つにあたる。
     rms, frame_length = compute_frame_rms(y, sample_rate)
     runs = [(s, e) for s, e, on in frames_to_runs(detect_active_frames_hysteresis(rms), frame_length, len(y)) if on]
     starts = np.array([s for s, _ in runs])
     margin = frame_length  # 区間の端と有音の端は1フレーム程度ずれることがある
     patterns: list[str] = []
+    # (2) 文字の区間ごとに、その中に収まる「鳴っている区間」を順に集め、長さで短点(.)か長点(-)に分ける。
+    #     例: 区間の中に 60ms・180ms・60ms の音があり短点が60msなら ".-."
     for start, end in ranges:
+        # 開始位置で二分探索し、区間に入る最初の「鳴っている区間」から調べる(音声全体を毎回なめない)
         first = int(np.searchsorted(starts, start - margin))
         elements = []
         for s, e in runs[first:]:
             if s > end + margin:
-                break
+                break  # 区間より後ろに来たら、この区間の分は終わり
             if e <= end + margin:
                 elements.append("-" if (e - s) / sample_rate >= 2 * dot_seconds else ".")
         patterns.append("".join(elements))
@@ -131,6 +168,7 @@ def tokens_from_sequence(sequence, sample_rate: int, patterns: list[str] | None 
     chars = sequence.characters
     tokens = []
     for i, c in enumerate(chars):
+        # 直後の無音 = 次の区間の始まり − この区間の終わり。60字ごとの信号のあとの約5秒を見分けるのに使う
         pause = (chars[i + 1].start_sample - c.end_sample) / sample_rate if i + 1 < len(chars) else None
         tokens.append(Token(c.result.prediction, patterns[i] if patterns else None, pause))
     return tokens
@@ -138,11 +176,14 @@ def tokens_from_sequence(sequence, sample_rate: int, patterns: list[str] | None 
 
 def _is(token: Token, *codes: str) -> bool:
     """音から読んだ符号が codes のどれかと一致し、かつモデルの文字の符号とは違う(=符号表に無い信号)。"""
+    # 例: モデルが「エ」(-.---)と出し、音の符号が -..--- なら本文の始まりの信号。
+    #     音の符号も -.--- なら、それは本物の「エ」なので信号ではない。
     return token.pattern in codes and MORSE_CODE_TABLE.get(token.text) != token.pattern
 
 
 def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReading:
     """認識した区間の列を電報形式として読む。mode: auto(判定して適用)/ off(しない)/ on(判定せず適用)。"""
+    # 判定が外れたときに返す「認識結果そのまま」(濁音は1文字に結合した形)
     raw_text = compose_dakuten("".join(t.text for t in tokens))
     if mode == "off" or not tokens:
         return TelegramReading(False, raw_text, raw_text)
@@ -161,6 +202,7 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
     toks = toks[first:last]
 
     # (1) 開始の信号: 先頭の HR(ヌナ)の繰り返しと「、」
+    #     モデルの文字は1区間=1文字なので、文字列の位置 i がそのまま区間の番号になる
     i = 0
     labels = "".join(t.text for t in toks)
     while labels.startswith(HR, i):
@@ -170,10 +212,11 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
         signals.append("開始" + ("(HR付き)" if i > 0 else ""))
         i += len(START_SIGNAL)
     else:
-        i = 0
+        i = 0  # 開始の信号が無ければ、HRに見えた部分も消さずに残す
     toks = toks[i:]
 
     # (2) 終了の信号: 末尾の ...-. / ...-.-(音で読めないときは末尾の「チ」)
+    #     音の符号が読めた場合は、本文の最後の本物の「チ」(..-.)は消さない
     end = len(toks)
     while end > 0 and _is(toks[end - 1], *END_CODES):
         end -= 1
@@ -184,7 +227,8 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
         signals.append("終了")
     toks = toks[:end]
 
-    # (3) 前文
+    # (3) 前文: 正規表現で欄に分ける。受付時刻だけは略体の数字を数字に戻す
+    #     (字数・局番号・発信番号は通常の数字の符号で送られるので、そのまま使う)
     m, rest_from = _match_header(toks)
     header_fields: dict[str, str] = {}
     header = ""
@@ -198,12 +242,16 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
             "発信番号": m["serial"],
             "受付時刻": f"{m['ampm']}{hour}時{minute}分",
         }
+        # 採点用の前文: 正解テキストの1行目(「一四二　四七　七八　セ五、三九」)と同じ並び。
+        # ハツ・タナ・時刻のあとの区切りの「、」は送信の手順なので含めない。
         header = f"{m['count']}{station}{m['serial']}{m['ampm']}{hour}、{minute}"
-    rest = toks[rest_from:]
+    rest = toks[rest_from:]  # 前文より後ろ = 名あて + 本文の始まりの信号 + 本文
 
     # (4) 本文の始まりの信号(-..---)。音で読めなければ、字数から予想した位置に近い「エ」
     body_start = next((k for k, t in enumerate(rest) if _is(t, BODY_START_CODE)), None)
     if body_start is None and m:
+        # 後ろから数える: 本文 = 字数ぶんの文字 + 60字ごとの信号(字数が60を超えるごとに1つ)。
+        # その直前の1区間が本文の始まりの信号のはず。
         declared = int(m["count"])
         n_every60 = max(0, (declared - 1) // 60)
         expected = len(rest) - declared - n_every60 - 1
@@ -212,6 +260,7 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
             body_start = min(candidates, key=lambda k: abs(k - expected))
     has_body_start = body_start is not None
 
+    # 電報形式と判定する条件: 前文の形 + ほかの信号が1つ以上(前文の形だけでは判定しない)
     detected = bool(m) and (has_start or has_end or has_body_start)
     if mode == "auto" and not detected:
         return TelegramReading(False, raw_text, raw_text)
@@ -232,12 +281,13 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
     k = 0
     while k < len(body_toks):
         t = body_toks[k]
+        # 候補: 音の符号が ..--.. か、音が読めないときの「ト」(本物の「ト」..-.. は候補にしない)
         looks_like = _is(t, EVERY_60_CODE) or (t.text == "ト" and t.pattern in (None, EVERY_60_CODE))
         if looks_like:
             pause, after = _pause_skipping_blips(body_toks, k)
             if pause >= LONG_PAUSE_SECONDS:
                 n60 += 1
-                k = after
+                k = after  # 信号と、そのあとの無音の中の雑音(ヘ)をまとめて飛ばす
                 continue
         kept_body.append(t)
         k += 1
@@ -246,6 +296,7 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
     address = compose_dakuten("".join(_restore_brackets(address_toks)))
     body = compose_dakuten("".join(_restore_brackets(kept_body)))
 
+    # 字数による検算: 正しく読めていれば、本文の文字数(括弧・区切りを含む)は前文の字数と一致する
     if m and len(body) != int(m["count"]):
         warnings.append(f"本文の文字数({len(body)}字)が前文の字数({m['count']}字)と合いません。要確認")
 
@@ -264,6 +315,8 @@ def interpret_telegram(tokens: list[Token], mode: str = "auto") -> TelegramReadi
 
 def _pause_skipping_blips(tokens: list[Token], k: int) -> tuple[float, int]:
     """tokens[k] のあとの無音の長さ(間に挟まった雑音 ヘ を飛ばして足し合わせる)と、無音の次の区間の位置。"""
+    # 例: ト(無音1.5秒)ヘ(無音1.5秒)ヘ(無音1.5秒)イ → 無音は合計4.5秒、次の区間は「イ」の位置。
+    #     雑音の ヘ そのものの長さは足していないので、実際の無音より少し短めに見積もる(安全側)。
     pause = 0.0
     j = k
     while j < len(tokens):
@@ -276,9 +329,12 @@ def _pause_skipping_blips(tokens: list[Token], k: int) -> tuple[float, int]:
 
 def _match_header(toks: list[Token]) -> tuple[re.Match | None, int]:
     """前文を読む。戻り値は (一致, 前文の次の区間の位置)。読めなければ ヘ を飛ばして読み直す。"""
+    # 1回目: 認識結果そのままで読む
     m = HEADER_RE.match("".join(t.text for t in toks))
     if m:
         return m, m.end()
+    # 2回目: ヘ を除いた文字列で読む。kept[n] は「ヘを除いた文字列のn文字目」が元の何番目の区間かを表すので、
+    #        一致の終わり(m.end())を元の区間の位置に戻せる
     kept = [k for k, t in enumerate(toks) if t.text != NOISE_BLIP]
     m = HEADER_RE.match("".join(toks[k].text for k in kept))
     if not m:
@@ -289,21 +345,24 @@ def _match_header(toks: list[Token]) -> tuple[re.Match | None, int]:
 def _restore_brackets(tokens: list[Token]) -> list[str]:
     """音から読んだ符号が括弧で、開きと閉じが対になっているものだけを括弧に戻す。"""
     texts = [t.text for t in tokens]
-    open_at = None
+    open_at = None  # まだ閉じていない開き括弧の候補の位置
     for k, t in enumerate(tokens):
         if _is(t, OPEN_BRACKET_CODE):
             open_at = k  # 開きが続いたら、閉じに近いほうを使う
         elif _is(t, CLOSE_BRACKET_CODE) and open_at is not None and k - open_at <= BRACKET_PAIR_MAX_TOKENS:
             texts[open_at], texts[k] = BRACKET_BY_CODE[OPEN_BRACKET_CODE], BRACKET_BY_CODE[CLOSE_BRACKET_CODE]
             open_at = None
+    # 相手の見つからなかった候補は、モデルの文字(サ・ン など)のまま残る
     return texts
 
 
 def read_telegram(sequence, y: np.ndarray, sample_rate: int, dot_seconds: float, mode: str = "auto") -> TelegramReading:
     """認識結果(SequencePrediction)と認識に使った波形から、電報形式として読む(アプリ・評価用の入口)。"""
     if mode == "off":
+        # 適用しないなら、音から符号を読み取る手間も省く
         tokens = tokens_from_sequence(sequence, sample_rate)
         return interpret_telegram(tokens, "off")
+    # y は認識に使った波形(前処理ONなら前処理後)。区間の位置はこの波形のサンプル番号で表されている
     ranges = [(c.start_sample, c.end_sample) for c in sequence.characters]
     patterns = read_element_patterns(y, sample_rate, ranges, dot_seconds) if ranges else []
     return interpret_telegram(tokens_from_sequence(sequence, sample_rate, patterns), mode)
