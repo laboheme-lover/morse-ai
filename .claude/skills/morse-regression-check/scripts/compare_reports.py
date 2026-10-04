@@ -37,12 +37,15 @@ def detect_keys(df: pd.DataFrame) -> list[str]:
         return ["sound_file"]
     if {"category", "message_no"} <= set(df.columns):
         return ["category", "message_no"]
+    if {"file", "pattern"} <= set(df.columns):  # evaluate_audio_variants.py の明細
+        return ["file"]
     raise ValueError(f"キー列が見つかりません(列: {list(df.columns)})")
 
 
 def fmt(value) -> str:
     if isinstance(value, float):
-        return f"{value:.4f}"
+        # 文字数などの整数値は、比較のための結合で小数型になっても整数で表示する
+        return str(int(value)) if value.is_integer() else f"{value:.4f}"
     return str(value)
 
 
@@ -89,13 +92,16 @@ def main() -> int:
         print(f"| {m} | {before:.4f} | {after:.4f} | {after - before:+.4f} |")
     print()
 
-    group_cols = [c for c in ("noise_type", "snr_db") if c in new.columns]
+    group_cols = [c for c in ("speed", "noise", "noise_type", "snr_db") if c in new.columns]
     if group_cols and "char_match_rate" in metrics:
         print("## 条件別の文字一致率(共通の件のみ)\n")
         extra = new[keys + group_cols]
         grouped = both.merge(extra, on=keys, how="left")
         if "snr_db" in grouped:
             grouped["snr_db"] = grouped["snr_db"].astype(object).where(grouped["snr_db"].notna(), "clean")
+        for c in ("speed", "noise"):  # 加工音源の明細では、原音の速度・雑音が空欄
+            if c in grouped:
+                grouped[c] = grouped[c].astype(object).where(grouped[c].notna(), "(原音)")
         print("| " + " | ".join(group_cols) + " | 件数 | 前回 | 今回 | 差 |")
         print("|" + "---|" * (len(group_cols) + 4))
         for name, g in grouped.groupby(group_cols, dropna=False):

@@ -35,6 +35,10 @@ DEFAULT_SUMMARY_CSV = Path("evaluation/audio_variants_summary.csv")
 # ファイル名 "no041_fast_white_snrp10" を (番号, 速度, 雑音, SN比) に分解する
 VARIANT_RE = re.compile(r"^(no\d+)_(?:(original)|(fast|normal|slow)_(clean|white|esc50)(?:_snr([mp])(\d+))?)$")
 
+# 電気通信術受信練習用原信(audio2)の正解テキストは、1行目に送信されない見出し
+# (例「一・二総通：電気通信術受信練習用原信（和文）　電文1」)があり、数字を漢数字で書いている。
+TITLE_LINE_RE = re.compile(r"電気通信術受信練習用原信")
+
 SPEED_ORDER = ["fast", "normal", "slow"]
 NOISE_ORDER = ["clean", "white", "esc50"]
 SNR_ORDER = [20, 10, 5, 0, -5]
@@ -89,12 +93,33 @@ def pattern_sort_key(speed: str, noise: str, snr_db) -> tuple:
     return (1, SPEED_ORDER.index(speed), NOISE_ORDER.index(noise), snr_index)
 
 
-def find_jobs(root: Path, which: str) -> list[dict]:
-    """評価対象の (WAV, 正解テキスト) の組を集める。which = original / processed / all"""
+def prepare_ground_truth(raw_text: str) -> tuple[str, list[str]]:
+    """正解テキストを認識結果と比べられる形にする。
+
+    evaluate_real_samples.normalize_ground_truth(ひらがな→カタカナ・NFKC・小書き仮名・語彙で絞り込み)の前に、
+    (1) 送信されない見出し行を除き、(2) 漢数字を算用数字に変換する。漢数字のままだと
+    「未対応の文字」として捨てられ、正解から数字が抜け落ちてしまう(本文は漢数字以外の漢字を含まない)。
+    見出し・漢数字の無いテキスト(実録音 audio の44件)では結果は変わらない。
+    """
+    from evaluate_real_samples import normalize_ground_truth
+    from generate_real_text_synthetic_dataset import KANJI_DIGIT
+
+    lines = [line for line in raw_text.splitlines() if not TITLE_LINE_RE.search(line)]
+    text = "".join(KANJI_DIGIT.get(ch, ch) for ch in "\n".join(lines))
+    return normalize_ground_truth(text)
+
+
+def find_jobs(root: Path, which: str, folder_regex: str | None = None) -> list[dict]:
+    """評価対象の (WAV, 正解テキスト) の組を集める。which = original / processed / all
+
+    folder_regex を指定すると、フォルダ名がその正規表現に一致するものだけを対象にする。
+    """
     jobs: list[dict] = []
     for wav in sorted(root.glob("*/*.wav")):
         info = parse_variant(wav.stem)
         if info is None:
+            continue
+        if folder_regex and not re.fullmatch(folder_regex, info["folder"]):
             continue
         is_original = info["pattern"] == "original"
         if which == "original" and not is_original:
@@ -130,7 +155,7 @@ def _evaluate_job(job: dict) -> dict:
     import librosa
 
     from app import recognize
-    from evaluate_real_samples import compare_texts, normalize_ground_truth
+    from evaluate_real_samples import compare_texts
     from morse_dataset import SAMPLE_RATE
     from morse_segmentation import DEFAULT_MIN_CHAR_GAP_SECONDS
     from morse_table import compose_dakuten
@@ -141,7 +166,7 @@ def _evaluate_job(job: dict) -> dict:
     try:
         model, index_to_label, fixed_frames = _MODEL
         raw_text = Path(job["txt"]).read_text(encoding="utf-8-sig")
-        ground_truth, excluded = normalize_ground_truth(raw_text)
+        ground_truth, excluded = prepare_ground_truth(raw_text)
 
         y, sr = librosa.load(job["wav"], sr=SAMPLE_RATE, mono=True)
         # アプリと同じ処理: 自動推定ON・前処理ON(手動しきい値の値は自動推定ONなら使われない)
@@ -184,10 +209,10 @@ def load_done(details_csv: Path) -> set[str]:
         return {r["file"] for r in csv.DictReader(f) if not r.get("error")}
 
 
-def run(root: Path, which: str, details_csv: Path, models_dir: str, workers: int) -> None:
+def run(root: Path, which: str, details_csv: Path, models_dir: str, workers: int, folder_regex: str | None = None) -> None:
     from multiprocessing import Pool
 
-    jobs = find_jobs(root, which)
+    jobs = find_jobs(root, which, folder_regex)
     done = load_done(details_csv)
     todo = [j for j in jobs if j["file"] not in done]
     print(f"対象 {len(jobs)}件 / 処理済み {len(jobs) - len(todo)}件 / 今回 {len(todo)}件 (workers={workers})", flush=True)
@@ -261,6 +286,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--models-dir", default="models")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 4))
     parser.add_argument("--summary-only", action="store_true", help="認識はせず、既存の明細から集計だけ行う")
+    parser.add_argument("--folder-regex", default=None, help="対象フォルダ名の正規表現(例 'no0(4[1-9]|[5-8][0-9])')")
     return parser.parse_args()
 
 
@@ -268,7 +294,7 @@ def main() -> None:
     args = _parse_args()
     details_csv = Path(args.details_csv)
     if not args.summary_only:
-        run(Path(args.root), args.which, details_csv, args.models_dir, args.workers)
+        run(Path(args.root), args.which, details_csv, args.models_dir, args.workers, args.folder_regex)
     if details_csv.exists():
         summarize(details_csv, Path(args.summary_csv))
 

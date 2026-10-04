@@ -215,3 +215,66 @@ def test_predict_sequence_from_waveform_matches_file_based_predict_sequence(tmp_
 
     assert from_waveform.text == from_file.text
     assert len(from_waveform.characters) == len(from_file.characters)
+
+
+# --- ヘ/ム(要素1つの文字)を音の長さで判定し直す ------------------------------
+
+
+def _timed_sequence(items):
+    """(予測文字, 音の長さ[秒]) の並びから、区間付きの認識結果を作る。"""
+    from predict_sequence import SequencePrediction
+
+    characters, start = [], 0
+    for label, seconds in items:
+        end = start + int(round(seconds * SAMPLE_RATE))
+        characters.append(_fake_character(label, 0.7, start, end))
+        start = end + SAMPLE_RATE  # 文字の間に1秒空ける(長さの判定には使わない)
+    return SequencePrediction(text="".join(label for label, _ in items), characters=characters)
+
+
+def test_single_dash_misread_as_he_is_corrected_to_mu():
+    """速い送信(短点55ms)の長点(165ms)は遅い送信の短点と同じ長さで、モデルがヘと誤認する。
+    音声全体の短点長の3倍の長さなのでムに直す(audio2の実録音で実際に起きた誤り)。"""
+    from predict_sequence import correct_single_element_by_duration
+
+    seq = correct_single_element_by_duration(_timed_sequence([("ア", 0.5), ("ヘ", 0.165), ("ヘ", 0.055)]), 0.055)
+    assert seq.text == "アムヘ"
+    assert [c.duration_corrected for c in seq.characters] == [False, True, False]
+    # 確信度・候補はモデルの値のまま残す
+    assert seq.characters[1].result.confidence == 0.7
+    assert seq.characters[1].result.top_k[0].label == "ヘ"
+
+
+def test_single_dot_misread_as_mu_is_corrected_to_he():
+    from predict_sequence import correct_single_element_by_duration
+
+    seq = correct_single_element_by_duration(_timed_sequence([("ム", 0.08)]), 0.08)
+    assert seq.text == "ヘ"
+    assert seq.characters[0].duration_corrected is True
+
+
+def test_other_characters_are_never_changed():
+    """ヘ/ム以外は、長さが短くても長くても変えない。"""
+    from predict_sequence import correct_single_element_by_duration
+
+    seq = correct_single_element_by_duration(_timed_sequence([("イ", 0.05), ("ロ", 0.9), ("゛", 0.1)]), 0.06)
+    assert seq.text == "イロ゛"
+    assert not any(c.duration_corrected for c in seq.characters)
+
+
+def test_no_correction_without_plausible_dot_estimate():
+    """短点長が無い、または雑音で推定が崩れた(範囲外の)場合は判定し直さない。"""
+    from predict_sequence import correct_single_element_by_duration
+
+    original = _timed_sequence([("ヘ", 0.3)])
+    for dot in (None, 0.005, 248.6):
+        assert correct_single_element_by_duration(original, dot).text == "ヘ"
+
+
+def test_no_correction_when_dot_estimate_is_shorter_than_training_minimum():
+    """学習データの最短の短点(揺らぎ込みで45ms)より短い推定は、雑音で推定が崩れたとみなして使わない。"""
+    from predict_sequence import correct_single_element_by_duration
+
+    original = _timed_sequence([("ヘ", 0.1)])
+    assert correct_single_element_by_duration(original, 0.040).text == "ヘ"  # 範囲外: そのまま
+    assert correct_single_element_by_duration(original, 0.045).text == "ム"  # 範囲内: 0.1秒は2倍以上なのでム

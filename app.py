@@ -137,8 +137,10 @@ def recognize(
     # (3) 文字の区切りとみなす無音の長さを決める(自動推定 or 手動)
     gap = resolve_min_char_gap(analysis, min_char_gap_seconds, auto_gap)
     # (4) 区間分割 → 1文字ずつ推論
+    #     ヘ(短点1つ)/ム(長点1つ)は、測った短点の長さを基準に音の長さで判定し直す
     sequence = predict_sequence_from_waveform(
-        model_input, sr, model, index_to_label, fixed_frames, top_k=top_k, min_char_gap_seconds=gap, device=device
+        model_input, sr, model, index_to_label, fixed_frames, top_k=top_k, min_char_gap_seconds=gap, device=device,
+        dot_seconds=analysis.dot_duration_seconds,
     )
     return RecognitionResult(
         sequence=sequence, waveform=y, sample_rate=sr, analysis=analysis, min_char_gap_seconds=gap
@@ -172,6 +174,8 @@ def build_details_table(sequence: SequencePrediction, units: list[DisplayUnit]) 
                 "開始[秒]": round(segments[0].start_seconds, 2),
                 "終了[秒]": round(segments[-1].end_seconds, 2),
                 "要確認": "要確認" if unit.needs_review else "",
+                # ヘ/ムを音の長さで判定し直した文字(Top候補はモデル自身の判定のまま表示している)
+                "補正": "音の長さで判定" if any(s.duration_corrected for s in segments) else "",
             }
         )
     return pd.DataFrame(rows)

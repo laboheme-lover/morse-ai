@@ -92,7 +92,9 @@ def evaluate_row(
     # 文字の区切りのしきい値 = 測った短点の長さ × 1.8(アプリの自動推定と同じ規則)
     min_gap = max(min_gap_floor, dot_estimate * gap_multiplier)
 
-    result = predict_sequence(inference_path, models_dir=models_dir, top_k=top_k, min_char_gap_seconds=min_gap)
+    result = predict_sequence(
+        inference_path, models_dir=models_dir, top_k=top_k, min_char_gap_seconds=min_gap, dot_seconds=dot_estimate
+    )
     predicted_text = compose_dakuten(result.text)
 
     # 前処理用に作った一時WAVを消す

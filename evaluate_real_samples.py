@@ -197,7 +197,9 @@ def evaluate_pair(
     min_gap = max(min_gap_floor, dot_estimate * gap_multiplier)
 
     # (5) 連続音声認識を行い、「カ゛」を「ガ」のように結合して正解テキストと同じ表記にする
-    result = predict_sequence(inference_path, models_dir=models_dir, top_k=top_k, min_char_gap_seconds=min_gap)
+    result = predict_sequence(
+        inference_path, models_dir=models_dir, top_k=top_k, min_char_gap_seconds=min_gap, dot_seconds=dot_estimate
+    )
     predicted_text = compose_dakuten(result.text)
 
     if preprocess and isinstance(inference_path, Path):
