@@ -34,6 +34,7 @@ from predict_sequence import (
     build_display_units,
     predict_sequence_from_waveform,
 )
+from telegram_format import TelegramReading, read_telegram
 
 # ============================================================================
 # このアプリの仕組み(Streamlit)
@@ -66,6 +67,9 @@ AUTO_GAP_MULTIPLIER = 1.8
 AUTO_GAP_FLOOR_SECONDS = 0.08
 
 DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.5
+
+# 電報形式の解釈(telegram_format)の選択肢: 画面の表示 → mode
+TELEGRAM_MODES = {"自動": "auto", "オフ": "off", "オン": "on"}
 
 
 # --- 処理(UIから独立しており単体テストできる) ------------------------------
@@ -112,6 +116,7 @@ class RecognitionResult:
     sample_rate: int
     analysis: AudioAnalysis
     min_char_gap_seconds: float
+    model_input: np.ndarray | None = None  # 認識に使った波形(前処理ONなら前処理後)。電報形式の信号の読み取りに使う
 
 
 def recognize(
@@ -143,7 +148,8 @@ def recognize(
         dot_seconds=analysis.dot_duration_seconds,
     )
     return RecognitionResult(
-        sequence=sequence, waveform=y, sample_rate=sr, analysis=analysis, min_char_gap_seconds=gap
+        sequence=sequence, waveform=y, sample_rate=sr, analysis=analysis, min_char_gap_seconds=gap,
+        model_input=model_input,
     )
 
 
@@ -178,6 +184,15 @@ def build_details_table(sequence: SequencePrediction, units: list[DisplayUnit]) 
                 "補正": "音の長さで判定" if any(s.duration_corrected for s in segments) else "",
             }
         )
+    return pd.DataFrame(rows)
+
+
+def build_telegram_table(reading: TelegramReading) -> pd.DataFrame:
+    """電報形式として読んだ結果を「項目・内容」の表にする(前文の欄・名あて・本文の字数)。"""
+    rows = [{"項目": k, "内容": v} for k, v in reading.header_fields.items()]
+    rows.append({"項目": "名あて", "内容": reading.address})
+    rows.append({"項目": "本文の文字数", "内容": f"{len(reading.body)}字"})
+    rows.append({"項目": "見つけた信号", "内容": "、".join(reading.signals)})
     return pd.DataFrame(rows)
 
 
@@ -298,6 +313,15 @@ def main() -> None:
             "ノイズの多い録音では区間分割の精度が大きく改善するため既定でON(ノイズの少ない録音では"
             "ほぼ差はない)。",
         )
+        telegram_label = st.radio(
+            "電報形式の解釈",
+            list(TELEGRAM_MODES),
+            index=0,
+            horizontal=True,
+            help="無線の電報(和文電報形式)は、本文の前後に前文(字数・発信局・発信番号・受付時刻)と信号が付きます。"
+            "自動: 前文と信号が見つかったときだけ、前文・名あて・本文に分けて表示します(本文だけの音声はそのまま)。"
+            "オン: 判定せずに適用します。オフ: 適用しません。",
+        )
 
     # ----- 音声ファイルのアップロード -----
     uploaded = st.file_uploader(
@@ -328,6 +352,21 @@ def main() -> None:
     if not units:
         st.warning("音の区間が検出できませんでした。無音のファイル、または文字間隔しきい値が合っていない可能性があります。")
         return
+
+    # ----- 電報形式の解釈(前文・名あて・本文に分ける。認識はやり直さない) -----
+    reading = read_telegram(
+        result.sequence, result.model_input if result.model_input is not None else result.waveform,
+        result.sample_rate, result.analysis.dot_duration_seconds, TELEGRAM_MODES[telegram_label],
+    )
+    if reading.detected:
+        st.subheader("電報として読んだ結果")
+        st.markdown(f'<div style="font-size:1.6rem;line-height:2.2rem;word-break:break-all;">'
+                    f"{html.escape(reading.body)}</div>", unsafe_allow_html=True)
+        st.dataframe(build_telegram_table(reading), hide_index=True, use_container_width=True)
+        for warning in reading.warnings:
+            st.warning(warning)
+        st.caption("受付時刻の略体の数字は数字に戻し、開始・本文の始まり・60字ごと・終了の信号は本文から除きました。"
+                   "括弧は音の符号から戻しました。下の「認識結果」は信号を含むモデルの出力そのままです。")
 
     # ----- 右側: 認識結果・概要・測定結果 -----
     st.subheader("認識結果")

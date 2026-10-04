@@ -159,33 +159,10 @@ def normalize_message_text(raw_text: str) -> tuple[str, list[str]]:
     return filtered, excluded
 
 
-def generate_message_wav(
-    text: str,
-    output_path: Path,
-    esc50_root: Path,
-    esc50_available: bool,
-    seed: int,
-) -> dict:
-    """1電文分の連続音声WAVを、学習データ生成と同じ手続きで合成する。"""
-    rng = np.random.default_rng(seed)
-
-    # (1) 学習データと同じ規則で生成条件を抽選する。ただし電文1つにつき1回だけ
-    #     (1回の送信の中では速度・周波数・音量は一定)。
-    speed = str(rng.choice(sorted(SPEED_RANGES)))
-    params = resolve_generation_params(rng, speed=speed, randomize=True)
-
-    # (2) 電文全体を1本の連続音声にする(文字の間は7単位の無音)
-    waveform = sequence_to_waveform(
-        text,
-        dot_duration=params["dot_duration"],
-        frequency_hz=params["frequency_hz"],
-        amplitude=params["amplitude"],
-        sample_rate=SAMPLE_RATE,
-        timing_jitter=TIMING_JITTER,
-        rng=rng,
-        ramp_seconds=params["ramp_seconds"],
-    )
-
+def add_noise_and_save(
+    waveform: np.ndarray, output_path: Path, rng: np.random.Generator, esc50_root: Path, esc50_available: bool
+) -> tuple[np.ndarray, str, float | None, dict]:
+    """合成した波形に、学習データと同じ規則で雑音を加えてWAVに保存する(電報形式の合成データでも使う)。"""
     # (3) ノイズの種類を学習データと同じ比率で抽選する(なし20%・ホワイト40%・環境音40%)
     noise_type = _sample_noise_type(rng, esc50_available)
     snr_db: float | None = None
@@ -220,6 +197,38 @@ def generate_message_wav(
             "esc50_src_file": esc50_meta["esc50_src_file"],
         }
         waveform, _ = sf.read(output_path)
+
+    return waveform, noise_type, snr_db, esc50_fields
+
+
+def generate_message_wav(
+    text: str,
+    output_path: Path,
+    esc50_root: Path,
+    esc50_available: bool,
+    seed: int,
+) -> dict:
+    """1電文分の連続音声WAVを、学習データ生成と同じ手続きで合成する。"""
+    rng = np.random.default_rng(seed)
+
+    # (1) 学習データと同じ規則で生成条件を抽選する。ただし電文1つにつき1回だけ
+    #     (1回の送信の中では速度・周波数・音量は一定)。
+    speed = str(rng.choice(sorted(SPEED_RANGES)))
+    params = resolve_generation_params(rng, speed=speed, randomize=True)
+
+    # (2) 電文全体を1本の連続音声にする(文字の間は7単位の無音)
+    waveform = sequence_to_waveform(
+        text,
+        dot_duration=params["dot_duration"],
+        frequency_hz=params["frequency_hz"],
+        amplitude=params["amplitude"],
+        sample_rate=SAMPLE_RATE,
+        timing_jitter=TIMING_JITTER,
+        rng=rng,
+        ramp_seconds=params["ramp_seconds"],
+    )
+
+    waveform, noise_type, snr_db, esc50_fields = add_noise_and_save(waveform, output_path, rng, esc50_root, esc50_available)
 
     duration_sec = len(waveform) / SAMPLE_RATE
 

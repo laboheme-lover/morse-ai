@@ -262,3 +262,17 @@ def test_app_shows_error_for_corrupted_audio(app_test, tiny_models_dir):
 
     assert not app_test.exception
     assert any("失敗しました" in err.value for err in app_test.error)
+
+
+def test_build_telegram_table_lists_header_fields_address_and_body_length():
+    from app import build_telegram_table
+    from telegram_format import TelegramReading
+
+    reading = TelegramReading(
+        detected=True, text="", raw_text="",
+        header_fields={"字数": "3", "発信局": "74(番号)", "発信番号": "26", "受付時刻": "コ8時5分"},
+        address="オタル", body="アイウ", signals=["開始", "終了"],
+    )
+    table = build_telegram_table(reading)
+    assert table["項目"].tolist() == ["字数", "発信局", "発信番号", "受付時刻", "名あて", "本文の文字数", "見つけた信号"]
+    assert table.set_index("項目").loc["本文の文字数", "内容"] == "3字"

@@ -99,6 +99,10 @@
 | `evaluate_real_samples.py` | 連続音声認識の文字一致率・置換率・挿入率・脱落率。正解テキストの正規化(ひらがな→カタカナ等)も担う | 実録音 44件 |
 | `generate_real_text_synthetic_dataset.py` | 電気通信術受信練習用原信(修正版テキスト)から、①と同じ手順で連続音声を合成する | 最終確認データ 20電文(生成) |
 | `evaluate_real_text_synthetic_dataset.py` | 上で作ったデータで連続音声認識を評価する | 最終確認データ 20電文(評価) |
+| `evaluate_audio_variants.py` | 加工音源(速度・雑音・SN比)ごとの文字一致率を、アプリと同じ設定で測る | audio 44件・audio2 20件とその加工音源 |
+| `telegram_scoring.py` | 電報形式の正解テキストを前文・名あて・本文に分け、部分ごとに採点する(「」」=「。」、括弧は残す) | (採点の部品) |
+| `generate_telegram_synthetic_dataset.py` | 和文電報形式(前文・信号・略体の数字・60字ごとの信号)の合成音声を作る。後処理の開発用 | 電報形式の合成データ 60通(生成) |
+| `evaluate_telegram.py` | 電報形式の後処理(`telegram_format.py`)の前後の精度を、前文・名あて・本文ごとに測る | 電報形式の合成データ・audio2 |
 
 ### ④ 使う
 
@@ -108,6 +112,7 @@
 | `morse_segmentation.py` | 連続音声を、有音/無音の判定(ヒステリシス+デスパイク)と無音の長さで1文字ずつに区切る | `split_into_characters`, `detect_active_frames_hysteresis` |
 | `audio_preprocessing.py` | トーン周波数・短点の長さの測定、バンドパスフィルタ、音量の正規化 | `analyze_audio`, `preprocess_for_inference` |
 | `predict_sequence.py` | 区切る→1文字ずつ推論→文字列、の連続音声認識。濁音の結合 | `predict_sequence_from_waveform`, `build_display_units` |
+| `telegram_format.py` | 電報形式の音声を、前文(字数・発信局・発信番号・受付時刻)・名あて・本文に分けて読む後処理。信号と括弧は音の符号から見分け、略体の数字は時刻の欄だけ数字に戻す。本文だけの音声には何もしない | `read_telegram`, `interpret_telegram`, `read_element_patterns` |
 | `app.py` | Streamlitのブラウザ画面。アップロード→認識→表示 | `recognize`, `main` |
 | `visualize_audio.py` | 音声の波形とメルスペクトログラムを画像にする確認用ツール | `plot_waveform_and_spectrogram` |
 
@@ -129,7 +134,10 @@
 | `evaluate_real_samples` | `predict_sequence`, `audio_preprocessing`, `morse_table` |
 | `generate_real_text_synthetic_dataset` | `generate_dataset`, `generate_morse_audio`, `add_esc50_noise`, `esc50_manager`, `morse_table` |
 | `evaluate_real_text_synthetic_dataset` | `evaluate_real_samples`, `predict_sequence`, `audio_preprocessing`, `morse_table` |
-| `app` | `predict_sequence`, `predict`, `audio_preprocessing`, `morse_segmentation`, `morse_dataset` |
+| `telegram_format` | `morse_segmentation`, `morse_table` |
+| `telegram_scoring` | `evaluate_real_samples`, `generate_real_text_synthetic_dataset`, `morse_table` |
+| `app` | `predict_sequence`, `predict`, `audio_preprocessing`, `morse_segmentation`, `morse_dataset`, `telegram_format` |
+| `evaluate_telegram` | `app`, `telegram_format`, `telegram_scoring`, `evaluate_audio_variants`, `evaluate_real_samples` |
 
 学習(`train.py`)と推論(`predict.py`)が同じ `morse_dataset.py` の変換関数を使っているのが
 重要な点である。変換条件が1つでも違うと、モデルは学習時と違う形の入力を受け取って精度が落ちる。
@@ -145,13 +153,14 @@
 | `models/label_mapping.json` | `train.py` | `predict.py` ほか | 文字⇔番号の対応、入力の長さ(424) |
 | `models/last_model.pt`, `train_history.json` | `train.py` | `train.py --resume` | 学習の途中経過(再開用) |
 | `data/real_text_synthetic_test/` | `generate_real_text_synthetic_dataset.py` | `evaluate_real_text_synthetic_dataset.py` | 最終確認データ20電文の音声と正解 |
+| `data/telegram_synthetic_test/` | `generate_telegram_synthetic_dataset.py` | `evaluate_telegram.py` | 電報形式の合成データ60通の音声と正解 |
 | `evaluation/*.csv`, `*.png` | 評価プログラム各種 | (人が読む) | 評価結果 |
 
 大きなデータ・モデルの重み・評価結果のCSVは `.gitignore` でgitの管理対象から外している。
 
 ## 7. テスト
 
-`test_<プログラム名>.py` が、それぞれのプログラムの自動テストになっている(合計221件)。
+`test_<プログラム名>.py` が、それぞれのプログラムの自動テストになっている(合計246件)。
 `conftest.py` は、ESC-50が無い環境でもテストできるよう、小さな偽のESC-50データを用意する。
 
 ```powershell
