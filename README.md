@@ -10,6 +10,18 @@
 - Python: 3.11
 - 仮想環境: `.venv`
 
+## 新しい PC で使う(GitHub から)
+
+1. Python 3.11 と GitHub CLI(gh)を入れ、`gh auth login` でログインする(リポジトリが非公開のため)
+2. `gh repo clone laboheme-lover/morse-ai` で取ってくる(日本語を含まない場所でもよい)
+3. `setup.bat` をダブルクリック: `.venv` を作ってパッケージを入れ、学習済みモデル(`models/best_model.pt`)を Releases から取ってくる
+4. `start_app.bat` をダブルクリック: ブラウザでアプリが開く(http://localhost:8502)
+
+モデルを取ってこられないときは、https://github.com/laboheme-lover/morse-ai/releases から `best_model.pt` を落として `models` に置く。
+学習データ・録音・評価の結果は Git に入れていないので、評価をやり直すときは元の PC から移す。
+
+`main` への push と Pull Request のたびに、GitHub Actions でテストが動く(`.github/workflows/test.yml`。モデルや録音がなくても動くテストだけ)。
+
 ## セットアップ (PowerShell)
 
 ```powershell
