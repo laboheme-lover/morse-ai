@@ -29,3 +29,7 @@ morse-ai_transfer.zip
 # 実行ログ・Officeのロックファイル
 *.err
 ~$*
+
+# 聞き比べ用の見本(data/dataset からコピーしたもの)・評価の完了の目印
+data/noise_samples/
+*.flag
