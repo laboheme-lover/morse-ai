@@ -1,13 +1,15 @@
-torch
-torchvision
-torchaudio
-librosa
-numpy
-scipy
-pandas
-matplotlib
-seaborn
-scikit-learn
-soundfile
-streamlit
-pytest
+# Python 3.11.9 で確認。torch は CPU 版(GPU のPCでは https://pytorch.org/ の案内に従って入れ替える)
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0
+torchvision==0.29.0
+torchaudio==2.11.0
+librosa==0.11.0
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.0.5
+matplotlib==3.11.2
+seaborn==0.13.2
+scikit-learn==1.9.1
+soundfile==0.14.0
+streamlit==1.63.0
+pytest==9.1.1
