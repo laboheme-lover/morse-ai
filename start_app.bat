@@ -2,7 +2,7 @@
 rem Start the sound Morse app in the browser (port 8502; 8501 is used by another app).
 cd /d "%~dp0"
 if not exist .venv\Scripts\python.exe (
-  echo Run setup.ps1 first.
+  echo Run setup.bat first.
   pause
   exit /b 1
 )
