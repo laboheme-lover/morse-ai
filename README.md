@@ -1,5 +1,7 @@
 # 和文モールス信号AI翻訳アプリ
 
+このリポジトリのコードと文書は、Claude Code(Anthropic の AI)に日本語で指示して作成した。
+
 和文モールス信号の音声ファイルをPyTorchの小型CNNで文字認識し、日本語文字列として
 表示するStreamlitアプリ。ノイズ・速度・音量・タイミングの揺らぎに対するモデルの
 頑健性を検証することを目的とする。
@@ -12,13 +14,13 @@
 
 ## 新しい PC で使う(GitHub から)
 
-1. Python 3.11 と GitHub CLI(gh)を入れ、`gh auth login` でログインする(リポジトリが非公開のため)
-2. `gh repo clone laboheme-lover/morse-ai` で取ってくる(日本語を含まない場所でもよい)
+1. Python 3.11 を入れる(https://www.python.org/)
+2. `git clone https://github.com/laboheme-lover/morse-ai.git` で取ってくる(または GitHub のページの Code → Download ZIP)
 3. `setup.bat` をダブルクリック: `.venv` を作ってパッケージを入れ、学習済みモデル(`models/best_model.pt`)を Releases から取ってくる
 4. `start_app.bat` をダブルクリック: ブラウザでアプリが開く(http://localhost:8502)
 
 モデルを取ってこられないときは、https://github.com/laboheme-lover/morse-ai/releases から `best_model.pt` を落として `models` に置く。
-学習データ・録音・評価の結果は Git に入れていないので、評価をやり直すときは元の PC から移す。
+学習データ・評価に使った録音・評価の結果はリポジトリに含めていない(学習データは下の手順で作り直せる)。
 
 `main` への push と Pull Request のたびに、GitHub Actions でテストが動く(`.github/workflows/test.yml`。モデルや録音がなくても動くテストだけ)。
 
@@ -387,7 +389,7 @@ python -m pytest test_evaluate_real_samples.py -v
 
 ## 実データのテキストから合成テストデータを追加生成
 
-`C:\Users\daizo\社内研修\電気通信術受信練習用原信（和文）`にある実際の電気通信術
+プロジェクトの1つ上のフォルダの`電気通信術受信練習用原信（和文）`にある実際の電気通信術
 受信練習用原信(修正・統合版テキスト、20電文)を種に、`generate_dataset.py`(学習
 データ生成)と同じ手続き(速度カテゴリ抽選・周波数/振幅/立ち上がりのランダム化・
 タイミングジッター10%・ノイズ種別[clean/white/esc50]とSNRの抽選)で電文単位の
@@ -509,7 +511,7 @@ ESC-50 × SN比 +20〜-5dB、1音源あたり34件)の文字一致率を、ア�
 文字間隔の自動推定ON・前処理ON)で測る。結果はパターンごとに集計する。
 
 ```powershell
-python evaluate_audio_variants.py --root C:\Users\daizo\OneDrive\audio2 --which all --workers 24 `
+python evaluate_audio_variants.py --root <加工音源のフォルダ> --which all --workers 24 `
     --details-csv evaluation\audio2_variants_details.csv --summary-csv evaluation\audio2_variants_summary.csv
 ```
 
@@ -570,7 +572,7 @@ audio2の原音20件で、該当する区間の短点・長点の並びを音か
 python generate_telegram_synthetic_dataset.py
 # 後処理の前後を、前文・名あて・本文ごとに評価する
 python evaluate_telegram.py --root data\telegram_synthetic_test --details-csv evaluation\telegram_synthetic_details.csv
-python evaluate_telegram.py --root C:\Users\daizo\OneDrive\audio2 --which original --details-csv evaluation\telegram_audio2_details.csv
+python evaluate_telegram.py --root <加工音源のフォルダ> --which original --details-csv evaluation\telegram_audio2_details.csv
 # 後処理だけを変えたときは、保存した区間の列に後処理をかけ直す(認識はやり直さない)
 python evaluate_telegram.py --root data\telegram_synthetic_test --details-csv evaluation\telegram_synthetic_details.csv --rescore
 ```
@@ -656,3 +658,8 @@ morse-ai/
 ```
 
 仕様書のMilestone 1〜10は以上で一通り完了している。
+
+## ライセンス
+
+MIT ライセンス(`LICENSE`)。
+学習済みモデルは、雑音の素材に ESC-50(Piczak, 2015, CC BY-NC 3.0)を使って学習した。

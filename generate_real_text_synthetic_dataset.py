@@ -1,6 +1,6 @@
 """実際の電気通信術受信練習用原信(和文)テキストから、合成テストデータを生成する。
 
-`C:\\Users\\daizo\\社内研修\\電気通信術受信練習用原信（和文）` の実録音(mp3)には対応する
+プロジェクトの1つ上のフォルダにある `電気通信術受信練習用原信（和文）` の実録音(mp3)には対応する
 正解テキスト(修正版)が付属している。このテキストを種に、`generate_dataset.py`が
 学習データ生成で使ったのと同じ手続き(速度カテゴリの抽選・周波数/振幅/立ち上がりの
 ランダム化・タイミングジッター・ノイズ種別[clean/white/esc50]とSNRの抽選)で
@@ -53,9 +53,7 @@ from morse_table import is_supported
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-DEFAULT_MASTER_TEXT = Path(
-    r"C:\Users\daizo\社内研修\電気通信術受信練習用原信（和文）_修正版.txt"
-)
+DEFAULT_MASTER_TEXT = Path(__file__).resolve().parent.parent / "電気通信術受信練習用原信（和文）_修正版.txt"
 DEFAULT_OUTPUT_ROOT = Path("data/real_text_synthetic_test")
 DEFAULT_ESC50_ROOT = Path("data/ESC-50-master")
 

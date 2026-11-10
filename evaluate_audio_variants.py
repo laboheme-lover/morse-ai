@@ -1,6 +1,6 @@
 """加工音源(速度・雑音・SN比の違い)ごとの連続音声認識の精度を測るスクリプト。
 
-想定するフォルダ構成(C:\\Users\\daizo\\OneDrive\\audio):
+想定するフォルダ構成(既定は ホーム\\OneDrive\\audio。--root で変えられる):
     <root>/no041/no041_original.wav              原音
     <root>/no041/no041_fast_clean.wav            速度 fast・雑音なし
     <root>/no041/no041_fast_white_snrp10.wav     速度 fast・ホワイトノイズ・SN比 +10dB
@@ -41,7 +41,7 @@ from pathlib import Path
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-DEFAULT_ROOT = Path(r"C:\Users\daizo\OneDrive\audio")
+DEFAULT_ROOT = Path.home() / "OneDrive" / "audio"
 DEFAULT_DETAILS_CSV = Path("evaluation/audio_variants_details.csv")
 DEFAULT_SUMMARY_CSV = Path("evaluation/audio_variants_summary.csv")
 

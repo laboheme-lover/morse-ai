@@ -33,3 +33,8 @@ morse-ai_transfer.zip
 # 聞き比べ用の見本(data/dataset からコピーしたもの)・評価の完了の目印
 data/noise_samples/
 *.flag
+
+# PC の移し方の手順書(この PC だけで使う。公開しない)
+MIGRATION.md
+package_for_migration.ps1
+verify_migration_zip.ps1

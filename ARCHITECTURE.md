@@ -196,6 +196,4 @@ python -m pytest -q
 | ファイル | 役割 |
 |---|---|
 | `run_kuten_pipeline.sh` | 句点対応時に使った「データ生成→学習→評価」の一括実行スクリプト |
-| `package_for_migration.ps1`, `verify_migration_zip.ps1` | 新PCへの移行用ZIPの作成と中身の確認 |
-| `MIGRATION.md` | 新PC(GPU搭載)への移行手順 |
 | `.claude/skills/morse-regression-check/` | 変更後の再評価・前回比較の手順(Claude Code用スキル)と比較スクリプト |

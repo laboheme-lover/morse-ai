@@ -60,7 +60,7 @@ from telegram_format import (
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-DEFAULT_TEXT_ROOT = Path(r"C:\Users\daizo\OneDrive\audio")
+DEFAULT_TEXT_ROOT = Path.home() / "OneDrive" / "audio"
 DEFAULT_OUTPUT_ROOT = Path("data/telegram_synthetic_test")
 DEFAULT_ESC50_ROOT = Path("data/ESC-50-master")
 

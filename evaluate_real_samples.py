@@ -59,8 +59,8 @@ SMALL_KANA_TO_NORMAL = str.maketrans(
     }
 )
 
-DEFAULT_SOUND_DIR = Path(r"C:\Users\daizo\OneDrive\デスクトップ\和文モールス信号サンプル\Sound")
-DEFAULT_TEXT_DIR = Path(r"C:\Users\daizo\OneDrive\デスクトップ\和文モールス信号サンプル\TEXT")
+DEFAULT_SOUND_DIR = Path.home() / "OneDrive" / "デスクトップ" / "和文モールス信号サンプル" / "Sound"
+DEFAULT_TEXT_DIR = Path.home() / "OneDrive" / "デスクトップ" / "和文モールス信号サンプル" / "TEXT"
 DEFAULT_OUTPUT_CSV = Path("evaluation/real_samples_report.csv")
 
 

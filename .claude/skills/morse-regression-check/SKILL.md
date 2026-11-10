@@ -40,7 +40,7 @@ PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe evaluate_real_samples.py --no-
 ```
 
 - 素早く確認するなら `--limit 10`(数分)。最終確認は全44件(十数分〜)。
-- 正解テキストと音声は既定で `C:\Users\daizo\OneDrive\デスクトップ\和文モールス信号サンプル\` の Sound/TEXT を読む。別PCでは `--sound-dir` `--text-dir` を指定する。
+- 正解テキストと音声は既定で `ホーム\OneDrive\デスクトップ\和文モールス信号サンプル\` の Sound/TEXT を読む。別PCでは `--sound-dir` `--text-dir` を指定する。
 
 **最終確認データ20電文**(ノイズ条件あり。区間分割の頑健性の確認):
 
