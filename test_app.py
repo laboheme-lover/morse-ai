@@ -195,9 +195,29 @@ def test_app_shows_upload_prompt_before_any_file(app_test, tiny_models_dir):
 
 def test_app_reports_missing_model(app_test, tmp_path, monkeypatch):
     monkeypatch.setattr(predict, "DEFAULT_MODELS_DIR", tmp_path / "no_such_models")
+    monkeypatch.setenv("MORSE_MODEL_URL", (tmp_path / "no_such_file.pt").as_uri())  # 取ってこられない
     app_test.run()
     assert not app_test.exception
-    assert any("学習済みモデルが見つかりません" in err.value for err in app_test.error)
+    assert any("学習済みモデルを取ってこられませんでした" in err.value for err in app_test.error)
+    assert not list((tmp_path / "no_such_models").glob("*.part"))  # 途中のファイルを残さない
+
+
+def test_app_downloads_missing_model(app_test, tiny_models_dir, tmp_path, monkeypatch):
+    """Web で公開したときのように models/ に重みがなくても、Releases(ここでは手元のファイル)から取ってきて動く。"""
+    source = tmp_path / "release_best_model.pt"
+    (tiny_models_dir / "best_model.pt").replace(source)
+    monkeypatch.setenv("MORSE_MODEL_URL", source.as_uri())
+    app_test.run()
+    assert not app_test.exception
+    assert (tiny_models_dir / "best_model.pt").read_bytes() == source.read_bytes()
+    assert any("アップロード" in info.value for info in app_test.info)
+
+
+def test_ensure_model_keeps_existing_file(tmp_path):
+    path = tmp_path / "best_model.pt"
+    path.write_bytes(b"local")
+    app.ensure_model(path, url=(tmp_path / "missing.pt").as_uri())  # あるときは取りに行かない
+    assert path.read_bytes() == b"local"
 
 
 def test_app_default_sidebar_settings(app_test, tiny_models_dir):

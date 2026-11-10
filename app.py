@@ -13,6 +13,7 @@ import hashlib
 import html
 import os
 import tempfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +63,10 @@ SUPPORTED_AUDIO_TYPES = ["wav", "mp3"]
 # このファイルの場所を基準に解決する(どこから起動しても動くようにするため)。
 APP_DIR = Path(__file__).resolve().parent
 
+# 学習済みモデルはリポジトリに入れず、GitHub の Releases に置いている(Web で公開したときは起動時にここから取ってくる)
+MODEL_URL = os.environ.get("MORSE_MODEL_URL",  # テストでは手元のファイル(file://)に差し替える
+                           "https://github.com/laboheme-lover/morse-ai/releases/latest/download/best_model.pt")
+
 # 「文字間隔しきい値を自動推定する」場合、推定した短点長のこの倍率を文字境界とする。
 AUTO_GAP_MULTIPLIER = 1.8
 AUTO_GAP_FLOOR_SECONDS = 0.08
@@ -73,6 +78,21 @@ TELEGRAM_MODES = {"自動": "auto", "オフ": "off", "オン": "on"}
 
 
 # --- 処理(UIから独立しており単体テストできる) ------------------------------
+
+
+def ensure_model(path: Path, url: str = MODEL_URL) -> None:
+    """学習済みモデルがなければ url から取ってくる。途中で切れても壊れたファイルを残さないよう、一時ファイルに落としてから置き換える。"""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".part")
+    os.close(fd)
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def load_audio_bytes(audio_bytes: bytes, suffix: str, sample_rate: int = SAMPLE_RATE) -> tuple[np.ndarray, int]:
@@ -276,8 +296,13 @@ def main() -> None:
     models_dir = str(APP_DIR / DEFAULT_MODELS_DIR)
     best_model_path = Path(models_dir) / "best_model.pt"
     if not best_model_path.exists():
-        st.error(f"学習済みモデルが見つかりません: {best_model_path}。先に train.py で学習してください。")
-        return
+        try:
+            with st.spinner("学習済みモデルを GitHub から取ってきています..."):
+                ensure_model(best_model_path)
+        except Exception as exc:  # noqa: BLE001 - 通信できないときは、手で置く方法を示す
+            st.error(f"学習済みモデルを取ってこられませんでした({exc})。{MODEL_URL} から落として {best_model_path} に置くか、"
+                     "train.py で学習してください。")
+            return
     model_mtime = best_model_path.stat().st_mtime
 
     # ----- 左側(サイドバー): 認識設定 -----

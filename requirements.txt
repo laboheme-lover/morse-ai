@@ -1,8 +1,7 @@
-# Python 3.11.9 で確認。torch は CPU 版(GPU のPCでは https://pytorch.org/ の案内に従って入れ替える)
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-torch==2.14.0
-torchvision==0.29.0
-torchaudio==2.11.0
+# Python 3.11 で確認。Windows の torch は CPU 版。
+# Linux(GitHub Actions・Streamlit Community Cloud)では、GPU 用の大きな torch を避けて CPU 版の wheel を直接指定する
+torch==2.14.0 ; sys_platform != "linux"
+torch @ https://download.pytorch.org/whl/cpu/torch-2.14.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl ; sys_platform == "linux"
 librosa==0.11.0
 numpy==2.4.6
 scipy==1.17.1
