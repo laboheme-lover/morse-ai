@@ -1,5 +1,7 @@
 # 和文モールス信号AI翻訳アプリ
 
+**Web 版: https://wabun-morse-sound.streamlit.app/** (インストール不要。しばらく使われないと休止し、開いたときに起動を少し待つ)
+
 このリポジトリのコードと文書は、Claude Code(Anthropic の AI)に日本語で指示して作成した。
 
 和文モールス信号の音声ファイルをPyTorchの小型CNNで文字認識し、日本語文字列として
